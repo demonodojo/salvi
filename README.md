@@ -1,6 +1,6 @@
 # salvi
 
-Un vi escrito en [sal](../sal) que corre en Linux y en [soso](../soso).
+Un vi escrito en [sal](https://github.com/demonodojo/sal) que corre en Linux y en [soso](https://github.com/demonodojo/soso).
 
 ```sh
 ./build.sh                    # ./salvi (Linux) y ./salvi-soso (soso)
