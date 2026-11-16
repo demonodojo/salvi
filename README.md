@@ -116,3 +116,7 @@ si no coincide con el tag, la release avisa y publica la que haya generado.
 | `src/editor/render.sal`, `ex.sal` | pintado de líneas y ayudas de `:` |
 
 Fallos de sal encontrados por el camino: [docs/bugs-sal.md](docs/bugs-sal.md).
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).

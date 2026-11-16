@@ -52,7 +52,7 @@ jobs:
       - name: Empaquetar el binario de Linux
         run: |
           mkdir -p dist/linux
-          cp salvi README.md dist/linux/
+          cp salvi README.md LICENSE dist/linux/
           tar czf "salvi-${GITHUB_REF_NAME#v}-x86_64-linux.tar.gz" -C dist/linux .
 
       - name: Situar y clonar soso
