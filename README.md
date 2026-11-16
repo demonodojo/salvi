@@ -75,10 +75,14 @@ modifica el árbol de soso.
 
 `.github/workflows/ci.yml` compila en cada push y en cada PR y pasa
 `tests/run_tests.py` sobre el binario de Linux. El compilador `sal` no se
-construye: lo baja de su última release con `scripts/obtener-sal.sh` y lo
-deja dentro de un clon superficial de `sal` en `../sal`
-(`scripts/preparar-sal.sh`), porque `sal install` busca las bibliotecas
-estándar junto a las fuentes del compilador (`../sal/sal/std`).
+construye: lo baja de su última release con `scripts/obtener-sal.sh`.
+
+Ese binario lleva grabadas en compilación las rutas de `std/` y `runtime/` de
+la máquina donde se construyó, así que `scripts/preparar-sal.sh` clona `sal`
+en `../sal`, exporta `SAL_STD=../sal/std` y enlaza `runtime/` en la raíz del
+proyecto. Sin eso fallan `sal install` («… is not a directory (set
+SAL_STD)») y la compilación («…/runtime/sal_runtime.c: No such file or
+directory»).
 
 El caché se invalida con lo que de verdad cambia: el compilador se guarda
 bajo la etiqueta resuelta de la release de `sal` (no bajo `latest`) y el

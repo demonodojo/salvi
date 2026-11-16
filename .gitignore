@@ -2,5 +2,6 @@
 /salvi-soso
 /target/
 /dist/
+/runtime
 /sal_modules/
 __pycache__/

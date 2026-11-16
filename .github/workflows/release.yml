@@ -33,7 +33,7 @@ jobs:
       - name: Preparar el compilador sal
         env:
           SAL_VERSION: ${{ steps.sal-etiqueta.outputs.etiqueta }}
-        run: echo "SAL=$(./scripts/preparar-sal.sh)" >> "$GITHUB_ENV"
+        run: ./scripts/preparar-sal.sh >> "$GITHUB_ENV"
 
       - name: Compilar salvi para Linux
         run: ./build.sh linux
@@ -70,8 +70,6 @@ jobs:
             soso-${{ runner.os }}-${{ env.SOSO_REPO }}-
 
       - name: Compilar el paquete de soso
-        env:
-          SAL: ../sal/target/release/sal
         run: |
           cd "$(dirname "$GITHUB_WORKSPACE")/soso"
           cargo xtask pkg-pack salvi
