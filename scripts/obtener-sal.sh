@@ -49,6 +49,16 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+# Con una versión explícita no hace falta la red para reutilizar el binario
+# ya descargado (el CI lo restaura de su caché y evita el asset de la release).
+etiqueta=$destino/.etiqueta
+if [ "$modo" = descargar ] && [ "$version" != latest ] &&
+    [ -x "$destino/sal" ] && [ -f "$etiqueta" ] &&
+    [ "$(cat "$etiqueta")" = "$version" ]; then
+    echo "$(cd "$destino" && pwd)/sal"
+    exit 0
+fi
+
 descargar_json() {
     command -v jq >/dev/null 2>&1 || {
         echo "obtener-sal: hace falta jq para leer la release de $repo" >&2
@@ -124,4 +134,5 @@ fi
 
 mkdir -p "$destino"
 install -m 755 "$bin" "$destino/sal"
+printf '%s\n' "$version" > "$etiqueta"
 echo "$(cd "$destino" && pwd)/sal"

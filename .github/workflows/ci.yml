@@ -26,13 +26,12 @@ jobs:
           path: target/toolchain
           key: sal-${{ runner.os }}-${{ env.SAL_REPO }}-${{ steps.sal-etiqueta.outputs.etiqueta }}
 
-      - name: Descargar el compilador sal
-        id: sal
-        run: echo "ruta=$(./scripts/obtener-sal.sh target/toolchain)" >> "$GITHUB_OUTPUT"
+      - name: Preparar el compilador sal
+        env:
+          SAL_VERSION: ${{ steps.sal-etiqueta.outputs.etiqueta }}
+        run: echo "SAL=$(./scripts/preparar-sal.sh)" >> "$GITHUB_ENV"
 
       - name: Compilar salvi
-        env:
-          SAL: ${{ steps.sal.outputs.ruta }}
         run: ./build.sh linux
 
       - name: Pruebas en una pty
