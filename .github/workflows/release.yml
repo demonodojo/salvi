@@ -69,6 +69,18 @@ jobs:
           restore-keys: |
             soso-${{ runner.os }}-${{ env.SOSO_REPO }}-
 
+      - name: Preparar el SDK de Sal
+        run: |
+          soso="$(dirname "$GITHUB_WORKSPACE")/soso"
+          sal="$(dirname "$GITHUB_WORKSPACE")/sal"
+          pin=$(sed -n 's/^base=//p' "$soso/config/sal-source.lock")
+          # El árbol de sal viene del tag de la release; soso fija otro commit
+          # en config/sal-source.lock y el SDK solo se genera con ese.
+          git -C "$sal" fetch --depth 1 origin "$pin"
+          git -C "$sal" checkout --detach "$pin"
+          cd "$soso"
+          cargo xtask sal-build --cross-only
+
       - name: Compilar el paquete de soso
         run: |
           cd "$(dirname "$GITHUB_WORKSPACE")/soso"
