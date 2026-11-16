@@ -1,0 +1,6 @@
+[package]
+name = "salvi"
+version = "0.1.0"
+
+[dependencies]
+io = { std = "io" }

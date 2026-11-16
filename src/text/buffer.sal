@@ -1,0 +1,135 @@
+# Texto del fichero: una `List[String]` con una línea por elemento, sin el
+# salto final. Siempre hay al menos una línea.
+import "io/fs.sal"
+
+struct Buffer
+    lines: List[String]
+    path: String
+    dirty: Int
+
+static Buffer.empty(path: String) -> Buffer ! alloc
+    lines = List.new[String]()
+    lines.push(d"")
+    Buffer(lines, path, 0)
+
+static Buffer.from_text(text: &String, path: String) -> Buffer ! alloc
+    b = Buffer(split_lines(text), path, 0)
+    b
+
+method Buffer.count(&self) -> Int
+    self.lines.len()
+
+method Buffer.line(&self, i: Int) -> &String
+    self.lines.get(i)
+
+method Buffer.set_line(&mut self, i: Int, s: String) -> Unit ! alloc
+    self.lines.set(i, s)
+    self.dirty = 1
+
+method Buffer.insert_line(&mut self, at: Int, s: String) -> Unit ! alloc
+    tmp = List.new[String]()
+    while self.lines.len() > at
+        tmp.push(self.lines.pop())
+    self.lines.push(s)
+    while tmp.len() > 0
+        self.lines.push(tmp.pop())
+    self.dirty = 1
+
+# Inserta varias líneas a partir de `at`, en orden.
+method Buffer.insert_lines(&mut self, at: Int, xs: &List[String]) -> Unit ! alloc
+    tmp = List.new[String]()
+    while self.lines.len() > at
+        tmp.push(self.lines.pop())
+    i = 0
+    while i < xs.len()
+        self.lines.push(xs.get(i).clone())
+        i = i + 1
+    while tmp.len() > 0
+        self.lines.push(tmp.pop())
+    self.dirty = 1
+
+# Borra las líneas `from..=last`. Si no queda ninguna, deja una vacía.
+method Buffer.delete_lines(&mut self, from: Int, last: Int) -> Unit ! alloc
+    tmp = List.new[String]()
+    while self.lines.len() > last + 1
+        tmp.push(self.lines.pop())
+    while self.lines.len() > from
+        _x = self.lines.pop()
+    while tmp.len() > 0
+        self.lines.push(tmp.pop())
+    if self.lines.len() == 0
+        self.lines.push(d"")
+    self.dirty = 1
+
+# Sustituye todo el contenido.
+method Buffer.replace_all(&mut self, text: &String) -> Unit ! alloc
+    self.lines = split_lines(text)
+
+# Texto entero, una línea por `\n` (también tras la última).
+method Buffer.text(&self) -> String ! alloc
+    out = d""
+    i = 0
+    while i < self.lines.len()
+        out = out + self.lines.get(i) + "\n"
+        i = i + 1
+    out
+
+# Texto de las líneas `from..=last`, cada una terminada en `\n`.
+method Buffer.text_lines(&self, from: Int, last: Int) -> String ! alloc
+    out = d""
+    i = from
+    while i <= last && i < self.lines.len()
+        out = out + self.lines.get(i) + "\n"
+        i = i + 1
+    out
+
+method Buffer.byte_count(&self) -> Int
+    total = 0
+    i = 0
+    while i < self.lines.len()
+        total = total + self.lines.get(i).len() + 1
+        i = i + 1
+    total
+
+# Escribe en `path`. Devuelve los bytes escritos o un valor negativo.
+method Buffer.save_to(&self, path: &String) -> Int ! io, alloc
+    data = self.text()
+    Path.new(path.clone()).write(&data)
+
+# Parte `text` en líneas por `\n`. Un `\n` final no abre otra línea.
+fn split_lines(text: &String) -> List[String] ! alloc
+    out = List.new[String]()
+    n = text.len()
+    start = 0
+    while start < n
+        nl = text.index_from(&d"\n", start)
+        if nl < 0
+            out.push(text.slice(start, n))
+            start = n
+        else
+            out.push(text.slice(start, nl))
+            start = nl + 1
+    if out.len() == 0
+        out.push(d"")
+    out
+
+# Lee el fichero. Si no existe, el buffer queda vacío (fichero nuevo).
+fn load_file(path: &String) -> Buffer ! io, alloc
+    sz = Path.new(path.clone()).size()
+    if sz < 0
+        return Buffer.empty(path.clone())
+    text = read_file(path)
+    Buffer.from_text(&text, path.clone())
+
+# Como `split_lines`, pero un `\n` final sí abre una línea vacía.
+fn split_keep(text: &String) -> List[String] ! alloc
+    out = List.new[String]()
+    n = text.len()
+    start = 0
+    nl = text.index_from(&d"\n", 0)
+    while nl >= 0
+        out.push(text.slice(start, nl))
+        start = nl + 1
+        nl = text.index_from(&d"\n", start)
+    out.push(text.slice(start, n))
+    out

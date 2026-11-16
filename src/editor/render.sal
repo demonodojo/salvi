@@ -1,0 +1,94 @@
+# Pintado de una línea de texto en la ventana: desplazamiento horizontal,
+# tabuladores expandidos, controles como `?` y un tramo en vídeo inverso
+# (la selección visual).
+import "../term/terminal.sal"
+import "../text/utf8.sal"
+
+# Parte visible de `s` desde la columna `left`, con `width` columnas como
+# mucho. Los bytes `hs..he` van en vídeo inverso (`hs >= he`: sin tramo).
+fn render_line(s: &String, left: Int, width: Int, ts: Int, hs: Int, he: Int) -> String ! alloc
+    out = d""
+    col = 0
+    j = 0
+    n = s.len()
+    run = -1
+    inv = 0
+    limit = left + width
+    while j < n && col < limit
+        if hs < he && j == hs && inv == 0
+            if run >= 0
+                out = out + s.slice(run, j)
+                run = -1
+            out = out + csi(&d"7m")
+            inv = 1
+        if inv == 1 && j == he
+            if run >= 0
+                out = out + s.slice(run, j)
+                run = -1
+            out = out + csi(&d"27m")
+            inv = 0
+        c = s.char(j)
+        nx = next_char(s, j)
+        if c == 9 || c < 32 || c == 127
+            if run >= 0
+                out = out + s.slice(run, j)
+                run = -1
+            w = 1
+            if c == 9
+                w = ts - col % ts
+            k = 0
+            while k < w
+                if col + k >= left && col + k < limit
+                    if c == 9
+                        out = out + " "
+                    else
+                        out = out + "?"
+                k = k + 1
+            col = col + w
+        else
+            col = col + 1
+            if col > left && run < 0
+                run = j
+        j = nx
+    if run >= 0
+        out = out + s.slice(run, j)
+    # Una selección que llega al final de la línea marca una celda más.
+    if hs < he && he > n && col < limit && col >= left
+        if inv == 0
+            out = out + csi(&d"7m")
+            inv = 1
+        out = out + " "
+    if inv == 1
+        out = out + csi(&d"27m")
+    out
+
+fn digits(n: Int) -> Int
+    d = 1
+    v = n
+    while v >= 10
+        v = v / 10
+        d = d + 1
+    d
+
+fn pad_left(s: &String, w: Int) -> String ! alloc
+    if s.len() >= w
+        return s.clone()
+    spaces(w - s.len()) + s
+
+fn pad_right(s: &String, w: Int) -> String ! alloc
+    if s.len() >= w
+        return s.slice(0, w)
+    s + spaces(w - s.len())
+
+# Columnas que ocupa `s` (un carácter por columna, sin tabuladores).
+fn str_width(s: &String) -> Int
+    display_col(s, s.len(), 8)
+
+# `s` recortado o rellenado con espacios hasta `w` columnas.
+fn fit(s: &String, w: Int) -> String ! alloc
+    if w <= 0
+        return d""
+    sw = str_width(s)
+    if sw > w
+        return s.slice(0, byte_at_col(s, w, 8))
+    s + spaces(w - sw)

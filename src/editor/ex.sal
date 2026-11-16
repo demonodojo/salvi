@@ -1,0 +1,96 @@
+# Ayudas de la línea de órdenes (`:`): recorte, sustitución literal y
+# análisis de `:s/patrón/reemplazo/flags`.
+import "../text/utf8.sal"
+
+fn trim(s: &String) -> String ! alloc
+    a = 0
+    b = s.len()
+    while a < b && (s.char(a) == 32 || s.char(a) == 9)
+        a = a + 1
+    while b > a && (s.char(b - 1) == 32 || s.char(b - 1) == 9)
+        b = b - 1
+    s.slice(a, b)
+
+# Apariciones de `pat` en `s` sin solaparse (como las sustituye `replace_str`).
+fn count_occ(s: &String, pat: &String, all: Int) -> Int
+    if pat.len() == 0
+        return 0
+    n = 0
+    at = s.index_from(pat, 0)
+    while at >= 0
+        n = n + 1
+        if all == 0
+            break
+        at = s.index_from(pat, at + pat.len())
+    n
+
+fn replace_str(s: &String, pat: &String, rep: &String, all: Int) -> String ! alloc
+    if pat.len() == 0
+        return s.clone()
+    out = d""
+    start = 0
+    at = s.index_from(pat, 0)
+    while at >= 0
+        out = out + s.slice(start, at) + rep
+        start = at + pat.len()
+        if all == 0
+            break
+        at = s.index_from(pat, start)
+    out = out + s.slice(start, s.len())
+    out
+
+# Trozo `i` (0 patrón, 1 reemplazo, 2 flags) de `/pat/rep/flags`: `body`
+# empieza en el delimitador. `\` + delimitador es el delimitador literal.
+fn subst_part(body: &String, i: Int) -> String ! alloc
+    if body.len() == 0
+        return d""
+    dl = body.char(0)
+    part = 0
+    out = d""
+    j = 1
+    n = body.len()
+    while j < n
+        c = body.char(j)
+        if c == 92 && j + 1 < n && body.char(j + 1) == dl
+            if part == i
+                out = out + String.from_char(dl)
+            j = j + 2
+        elsif c == dl && part < 2
+            part = part + 1
+            j = j + 1
+        else
+            out = out + subst_char(c, part == i)
+            j = j + 1
+    out
+
+fn subst_char(c: Int, keep: Int) -> String ! alloc
+    if keep == 1
+        String.from_char(c)
+    else
+        d""
+
+# Siguiente palabra (separada por blancos) de `s` a partir de `i`.
+fn word_at(s: &String, i: Int) -> String ! alloc
+    a = i
+    while a < s.len() && s.char(a) == 32
+        a = a + 1
+    b = a
+    while b < s.len() && s.char(b) != 32
+        b = b + 1
+    s.slice(a, b)
+
+fn parse_int(s: &String) -> Int
+    n = 0
+    i = 0
+    while i < s.len() && is_digit(s.char(i)) == 1
+        n = n * 10 + s.char(i) - 48
+        i = i + 1
+    n
+
+fn starts_with(s: &String, p: &String) -> Int ! alloc
+    if p.len() > s.len()
+        return 0
+    if s.slice(0, p.len()).eq(p.clone()) == 1
+        1
+    else
+        0

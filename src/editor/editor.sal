@@ -1,0 +1,1804 @@
+# Estado del editor y sus modos: normal, inserción, reemplazo, visual y la
+# línea de órdenes (`:`, `/`, `?`).
+#
+# Cada orden de modo normal (con su inserción, si la abre) es una unidad de
+# deshacer: la primera modificación guarda una instantánea del texto. Las
+# teclas de la última orden que cambió el texto se guardan para `.`.
+import "../term/terminal.sal"
+import "../term/key_reader.sal"
+import "../term/keys.sal"
+import "../text/buffer.sal"
+import "../text/motion.sal"
+import "../text/utf8.sal"
+import "render.sal"
+import "ex.sal"
+
+M_NORMAL = 0
+
+M_INSERT = 1
+
+M_CMD = 2
+
+M_VISUAL = 3
+
+M_VLINE = 4
+
+M_REPLACE = 5
+
+WANT_END = 1099511627776
+
+struct Editor
+    buf: Buffer
+    term: Terminal
+    keys: KeyReader
+    row: Int
+    col: Int
+    want: Int
+    top: Int
+    left: Int
+    mode: Int
+    msg: String
+    cmd: String
+    cmd_kind: Int
+    count: Int
+    op: Int
+    op_count: Int
+    pending: Int
+    reg: String
+    reg_lines: Int
+    undo: List[String]
+    undo_pos: List[Int]
+    redo: List[String]
+    redo_pos: List[Int]
+    snap: Int
+    changed: Int
+    search: String
+    search_back: Int
+    search_word: Int
+    find_kind: Int
+    find_ch: String
+    vrow: Int
+    vcol: Int
+    number: Int
+    ts: Int
+    sw: Int
+    et: Int
+    ai: Int
+    quit: Int
+    rec: List[Int]
+    last: List[Int]
+    feed: List[Int]
+    feed_pos: Int
+    from_feed: Int
+    rec_skip: Int
+
+static Editor.open(path: &String) -> Editor ! io, alloc
+    term = Terminal.open()
+    keys = KeyReader.new(term.linux)
+    buf = Buffer.empty(d"")
+    if path.len() > 0
+        buf = load_file(path)
+    Editor(buf, term, keys, 0, 0, 0, 0, 0, M_NORMAL, d"", d"", 58, 0, 0, 0, 0,
+           d"", 0, List.new[String](), List.new[Int](), List.new[String](), List.new[Int](),
+           0, 0, d"", 0, 0, 0, d"", 0, 0, 0, 8, 8, 0, 1, 0,
+           List.new[Int](), List.new[Int](), List.new[Int](), 0, 0, 0)
+
+# ---------------------------------------------------------------- bucle
+
+method Editor.run(&mut self, start_line: Int) -> Unit ! io, alloc
+    self.term.enter()
+    if start_line > 0
+        self.row = start_line - 1
+        self.clamp()
+        self.col = first_non_blank(self.buf.line(self.row))
+    self.msg = self.file_info()
+    self.render()
+    while self.quit == 0
+        k = self.next_key()
+        if k == K_EOF
+            break
+        self.handle(k)
+        if self.feed_pos >= self.feed.len()
+            self.render()
+    self.term.leave()
+
+method Editor.next_key(&mut self) -> Int ! io, alloc
+    if self.feed_pos < self.feed.len()
+        k = self.feed.get(self.feed_pos)
+        self.feed_pos = self.feed_pos + 1
+        self.from_feed = 1
+        return k
+    if self.feed.len() > 0
+        self.feed = List.new[Int]()
+        self.feed_pos = 0
+    self.from_feed = 0
+    self.keys.key()
+
+method Editor.idle(&self) -> Int
+    if self.mode == M_NORMAL && self.count == 0 && self.op == 0 && self.pending == 0
+        1
+    else
+        0
+
+method Editor.handle(&mut self, k: Int) -> Unit ! io, alloc
+    if k == K_NONE
+        return
+    if self.idle() == 1
+        if self.from_feed == 0
+            self.rec = List.new[Int]()
+            self.rec_skip = 0
+            self.msg = d""
+        self.changed = 0
+    if self.from_feed == 0
+        self.rec.push(k)
+    if self.mode == M_NORMAL
+        self.normal(k)
+    elsif self.mode == M_INSERT || self.mode == M_REPLACE
+        self.insert_key(k)
+    elsif self.mode == M_CMD
+        self.cmdline_key(k)
+    else
+        self.visual_key(k)
+    if self.idle() == 1
+        if self.changed == 1 && self.from_feed == 0 && self.rec_skip == 0
+            self.last = self.rec.clone()
+        self.changed = 0
+        self.snap = 0
+
+# ---------------------------------------------------------------- utilidades
+
+method Editor.text_h(&self) -> Int
+    h = self.term.rows - 2
+    if h < 1
+        1
+    else
+        h
+
+method Editor.last_row(&self) -> Int
+    self.buf.count() - 1
+
+method Editor.cnt(&self) -> Int
+    if self.count > 0
+        self.count
+    else
+        1
+
+# Cuenta total de una orden con operador (`2d3w` = 6). 0 si no hubo cuenta.
+method Editor.raw_count(&self) -> Int
+    if self.count == 0 && self.op_count == 0
+        return 0
+    a = self.count
+    b = self.op_count
+    if a == 0
+        a = 1
+    if b == 0
+        b = 1
+    a * b
+
+method Editor.reset_cmd(&mut self) -> Unit
+    self.count = 0
+    self.op = 0
+    self.op_count = 0
+    self.pending = 0
+
+method Editor.clamp(&mut self) -> Unit
+    last = self.last_row()
+    if self.row > last
+        self.row = last
+    if self.row < 0
+        self.row = 0
+    s = self.buf.line(self.row)
+    c = self.col
+    if self.mode == M_INSERT || self.mode == M_REPLACE
+        if c > s.len()
+            c = s.len()
+    elsif c > last_char(s)
+        c = last_char(s)
+    if c < 0
+        c = 0
+    self.col = char_start(s, c)
+
+method Editor.update_want(&mut self) -> Unit
+    self.want = display_col(self.buf.line(self.row), self.col, self.ts)
+
+method Editor.col_for_want(&self, r: Int) -> Int
+    s = self.buf.line(r)
+    if self.want >= WANT_END
+        last_char(s)
+    else
+        byte_at_col(s, self.want, self.ts)
+
+method Editor.file_info(&self) -> String ! io, alloc
+    name = self.buf.path.clone()
+    if name.len() == 0
+        return d"[Sin nombre]"
+    if self.buf.count() == 1 && self.buf.line(0).len() == 0 && self.buf.dirty == 0
+        return "\"" + name + "\" [Nuevo]"
+    "\"" + name + "\" " + self.buf.count().to_str() + "L, " + self.buf.byte_count().to_str() + "B"
+
+method Editor.indent_unit(&self) -> String ! alloc
+    if self.et == 0 && self.sw == self.ts
+        d"\t"
+    else
+        spaces(self.sw)
+
+# ---------------------------------------------------------------- deshacer
+
+fn pack_pos(r: Int, c: Int) -> Int
+    (r << 24) | (c & 16777215)
+
+method Editor.begin_change(&mut self) -> Unit ! alloc
+    if self.snap == 0
+        self.undo.push(self.buf.text())
+        self.undo_pos.push(pack_pos(self.row, self.col))
+        self.redo = List.new[String]()
+        self.redo_pos = List.new[Int]()
+        self.snap = 1
+    self.changed = 1
+
+method Editor.undo_step(&mut self, redo: Int) -> Unit ! alloc
+    n = self.undo.len()
+    if redo == 1
+        n = self.redo.len()
+    if n == 0
+        if redo == 1
+            self.msg = d"Ya en el cambio más reciente"
+        else
+            self.msg = d"Ya en el cambio más antiguo"
+        return
+    cur = self.buf.text()
+    curp = pack_pos(self.row, self.col)
+    t = d""
+    p = 0
+    if redo == 1
+        t = self.redo.pop()
+        p = self.redo_pos.pop()
+        self.undo.push(cur)
+        self.undo_pos.push(curp)
+    else
+        t = self.undo.pop()
+        p = self.undo_pos.pop()
+        self.redo.push(cur)
+        self.redo_pos.push(curp)
+    self.buf.replace_all(&t)
+    self.buf.dirty = 1
+    self.row = p >> 24
+    self.col = p & 16777215
+    self.clamp()
+    self.update_want()
+
+# ---------------------------------------------------------------- modo normal
+
+method Editor.normal(&mut self, k: Int) -> Unit ! io, alloc
+    if self.pending != 0
+        p = self.pending
+        self.pending = 0
+        self.normal_pending(p, k)
+        return
+    if (k >= 49 && k <= 57) || (k == 48 && self.count > 0)
+        if self.count < 10000000
+            self.count = self.count * 10 + k - 48
+        return
+    if self.op != 0
+        self.op_key(k)
+        return
+    self.normal_cmd(k)
+
+method Editor.is_vertical(&self, k: Int) -> Int
+    if k == 106 || k == 107 || k == K_DOWN || k == K_UP || k == 14 || k == 16
+        1
+    else
+        0
+
+method Editor.move_to(&mut self, m: Motion, k: Int) -> Unit
+    self.row = m.row
+    self.col = m.col
+    self.clamp()
+    if k == 36 || k == K_END
+        self.want = WANT_END
+    elsif self.is_vertical(k) == 0
+        self.update_want()
+
+# Movimiento de la tecla `k` con cuenta `n` (`raw` es la cuenta escrita, 0 si no hubo).
+method Editor.motion(&self, k: Int, n: Int, raw: Int) -> Motion ! alloc
+    r = self.row
+    s = self.buf.line(r)
+    last = self.last_row()
+    i = 0
+    if k == 104 || k == K_LEFT || k == K_BS || k == 8
+        c = self.col
+        while i < n && c > 0
+            c = prev_char(s, c)
+            i = i + 1
+        return Motion.at(r, c)
+    if k == 108 || k == K_RIGHT || k == 32
+        c = self.col
+        while i < n && c < s.len()
+            c = next_char(s, c)
+            i = i + 1
+        return Motion.at(r, c)
+    if k == 106 || k == K_DOWN || k == 14
+        t = r + n
+        if t > last
+            t = last
+        return Motion.at(t, self.col_for_want(t)).lines()
+    if k == 107 || k == K_UP || k == 16
+        t = r - n
+        if t < 0
+            t = 0
+        return Motion.at(t, self.col_for_want(t)).lines()
+    if k == 43 || k == K_ENTER
+        t = r + n
+        if t > last
+            t = last
+        return Motion.at(t, first_non_blank(self.buf.line(t))).lines()
+    if k == 45
+        t = r - n
+        if t < 0
+            t = 0
+        return Motion.at(t, first_non_blank(self.buf.line(t))).lines()
+    if k == 48 || k == K_HOME
+        return Motion.at(r, 0)
+    if k == 94
+        return Motion.at(r, first_non_blank(s))
+    if k == 124
+        return Motion.at(r, byte_at_col(s, n - 1, self.ts))
+    if k == 36 || k == K_END
+        t = r + n - 1
+        if t > last
+            t = last
+        return Motion.at(t, last_char(self.buf.line(t))).incl()
+    if k == 119 || k == 87 || k == 98 || k == 66 || k == 101 || k == 69
+        big = 0
+        if k == 87 || k == 66 || k == 69
+            big = 1
+        m = Motion.at(r, self.col)
+        while i < n
+            if k == 119 || k == 87
+                m = word_fwd(&self.buf, m.row, m.col, big)
+            elsif k == 98 || k == 66
+                m = word_back(&self.buf, m.row, m.col, big)
+            else
+                m = word_end(&self.buf, m.row, m.col, big)
+            i = i + 1
+        return m
+    if k == 71
+        t = last
+        if raw > 0
+            t = raw - 1
+        if t > last
+            t = last
+        return Motion.at(t, first_non_blank(self.buf.line(t))).lines()
+    if k == 125 || k == 123
+        m = Motion.at(r, self.col)
+        while i < n
+            if k == 125
+                m = para_fwd(&self.buf, m.row)
+            else
+                m = para_back(&self.buf, m.row)
+            i = i + 1
+        return m
+    if k == 37
+        return match_pair(&self.buf, r, self.col)
+    if k == 59 || k == 44
+        if self.find_kind == 0
+            return Motion.none()
+        kind = self.find_kind
+        if k == 44
+            kind = reverse_find(kind)
+        return self.find_motion(kind, &self.find_ch, n)
+    if k == 72 || k == 76 || k == 77
+        h = self.text_h()
+        bottom = self.top + h - 1
+        if bottom > last
+            bottom = last
+        t = self.top + n - 1
+        match k
+            76 =>
+                t = bottom - n + 1
+            77 =>
+                t = (self.top + bottom) / 2
+        if t < self.top
+            t = self.top
+        if t > bottom
+            t = bottom
+        return Motion.at(t, first_non_blank(self.buf.line(t))).lines()
+    Motion.none()
+
+fn reverse_find(kind: Int) -> Int
+    match kind
+        102 => 70
+        70 => 102
+        116 => 84
+        84 => 116
+        _ => kind
+
+fn key_text(k: Int) -> String ! alloc
+    if k == K_ENTER
+        return d"\r"
+    utf8_encode(k)
+
+method Editor.find_motion(&self, kind: Int, ch: &String, n: Int) -> Motion
+    c = find_in_line(self.buf.line(self.row), self.col, ch, kind, n)
+    if c < 0
+        return Motion.none()
+    m = Motion.at(self.row, c)
+    if kind == 102 || kind == 116
+        m.incl()
+    else
+        m
+
+method Editor.normal_pending(&mut self, p: Int, k: Int) -> Unit ! io, alloc
+    if k == K_ESC || is_special_key(k) == 1
+        self.reset_cmd()
+        return
+    n = self.cnt()
+    if self.op != 0
+        n = self.raw_count()
+        if n == 0
+            n = 1
+    if p == 102 || p == 70 || p == 116 || p == 84
+        ch = key_text(k)
+        self.find_kind = p
+        self.find_ch = ch.clone()
+        m = self.find_motion(p, &ch, n)
+        if m.ok == 1
+            if self.op != 0
+                self.apply_motion(self.op, m)
+            else
+                self.move_to(m, p)
+        self.reset_cmd()
+        return
+    if p == 103
+        if k == 103
+            raw = self.raw_count()
+            t = 0
+            if raw > 0
+                t = raw - 1
+            if t > self.last_row()
+                t = self.last_row()
+            m = Motion.at(t, first_non_blank(self.buf.line(t))).lines()
+            if self.op != 0
+                self.apply_motion(self.op, m)
+            else
+                self.move_to(m, k)
+        elsif k == 74 && self.op == 0
+            self.join_lines(n, 0)
+        self.reset_cmd()
+        return
+    if p == 114
+        self.replace_chars(k, n)
+        self.reset_cmd()
+        return
+    if p == 90
+        match k
+            90 => self.ex(&d"x")
+            81 => self.ex(&d"q!")
+        self.reset_cmd()
+        return
+    self.reset_cmd()
+
+method Editor.op_key(&mut self, k: Int) -> Unit ! io, alloc
+    raw = self.raw_count()
+    n = raw
+    if n == 0
+        n = 1
+    if k == K_ESC
+        self.reset_cmd()
+        return
+    if k == self.op
+        r2 = self.row + n - 1
+        if r2 > self.last_row()
+            r2 = self.last_row()
+        self.apply_lines(self.op, self.row, r2)
+        self.reset_cmd()
+        return
+    if k == 102 || k == 70 || k == 116 || k == 84 || k == 103
+        self.pending = k
+        return
+    mk = k
+    if self.op == 99 && (k == 119 || k == 87)
+        s = self.buf.line(self.row)
+        if self.col < s.len() && char_class(s.char(self.col)) != 0
+            if k == 119
+                mk = 101
+            else
+                mk = 69
+    m = self.motion(mk, n, raw)
+    if m.ok == 0
+        self.reset_cmd()
+        return
+    if (mk == 119 || mk == 87) && m.row > self.row
+        m = Motion.at(m.row - 1, self.buf.line(m.row - 1).len())
+    self.apply_motion(self.op, m)
+    self.reset_cmd()
+
+method Editor.normal_cmd(&mut self, k: Int) -> Unit ! io, alloc
+    n = self.cnt()
+    m = self.motion(k, n, self.count)
+    if m.ok == 1
+        self.move_to(m, k)
+        self.count = 0
+        return
+    if k == 100 || k == 99 || k == 121 || k == 62 || k == 60
+        self.op = k
+        self.op_count = self.count
+        self.count = 0
+        return
+    if k == 103 || k == 102 || k == 70 || k == 116 || k == 84 || k == 114 || k == 90
+        self.pending = k
+        return
+    self.normal_simple(k, n)
+    self.count = 0
+
+method Editor.normal_simple(&mut self, k: Int, n: Int) -> Unit ! io, alloc
+    s = self.buf.line(self.row)
+    len = s.len()
+    if k == 105 || k == K_INS
+        self.start_insert(M_INSERT)
+    elsif k == 97
+        if len > 0
+            self.col = next_char(s, self.col)
+        self.start_insert(M_INSERT)
+    elsif k == 73
+        self.col = first_non_blank(s)
+        if len > 0 && (s.char(self.col) == 32 || s.char(self.col) == 9)
+            self.col = len
+        self.start_insert(M_INSERT)
+    elsif k == 65
+        self.col = len
+        self.start_insert(M_INSERT)
+    elsif k == 111
+        self.open_line(1)
+    elsif k == 79
+        self.open_line(0)
+    elsif k == 82
+        self.start_insert(M_REPLACE)
+    elsif k == 118 || k == 86
+        self.vrow = self.row
+        self.vcol = self.col
+        if k == 118
+            self.mode = M_VISUAL
+        else
+            self.mode = M_VLINE
+    elsif k == 120 || k == K_DEL
+        if len > 0
+            self.apply_motion(100, self.motion(108, n, 0))
+    elsif k == 88
+        if self.col > 0
+            self.apply_motion(100, self.motion(104, n, 0))
+    elsif k == 68
+        self.apply_motion(100, self.motion(36, n, 0))
+    elsif k == 67
+        self.apply_motion(99, self.motion(36, n, 0))
+    elsif k == 115
+        if len == 0
+            self.start_insert(M_INSERT)
+        else
+            self.apply_motion(99, self.motion(108, n, 0))
+    elsif k == 83
+        self.apply_lines(99, self.row, self.clamp_row(self.row + n - 1))
+    elsif k == 89
+        self.apply_lines(121, self.row, self.clamp_row(self.row + n - 1))
+    elsif k == 112
+        self.put(1, n)
+    elsif k == 80
+        self.put(0, n)
+    elsif k == 74
+        self.join_lines(n, 1)
+    elsif k == 126
+        self.toggle_case(n)
+    elsif k == 117
+        self.undo_step(0)
+    elsif k == 18
+        self.undo_step(1)
+    elsif k == 46
+        self.repeat_last()
+    elsif k == 110
+        self.search_next(0)
+    elsif k == 78
+        self.search_next(1)
+    elsif k == 42 || k == 35
+        self.search_word_under(k)
+    elsif k == 58 || k == 47 || k == 63
+        self.open_cmdline(k, d"")
+    elsif k == 6 || k == K_PGDN
+        self.scroll_page(n)
+    elsif k == 2 || k == K_PGUP
+        self.scroll_page(0 - n)
+    elsif k == 4
+        self.scroll_half(1)
+    elsif k == 21
+        self.scroll_half(0 - 1)
+    elsif k == 5
+        self.scroll_line(n)
+    elsif k == 25
+        self.scroll_line(0 - n)
+    elsif k == 7
+        self.msg = self.file_info() + " --" + self.percent().to_str() + "%--"
+    elsif k == 12
+        self.term.measure()
+        self.term.write(&csi(&d"2J"))
+
+method Editor.clamp_row(&self, r: Int) -> Int
+    if r > self.last_row()
+        self.last_row()
+    elsif r < 0
+        0
+    else
+        r
+
+method Editor.percent(&self) -> Int
+    (self.row + 1) * 100 / self.buf.count()
+
+method Editor.start_insert(&mut self, mode: Int) -> Unit
+    self.mode = mode
+    self.reset_cmd()
+
+method Editor.open_line(&mut self, below: Int) -> Unit ! alloc
+    self.begin_change()
+    ind = d""
+    if self.ai == 1
+        ind = leading_ws(self.buf.line(self.row))
+    at = self.row
+    if below == 1
+        at = self.row + 1
+    c = ind.len()
+    self.buf.insert_line(at, ind)
+    self.row = at
+    self.col = c
+    self.start_insert(M_INSERT)
+
+method Editor.repeat_last(&mut self) -> Unit ! alloc
+    if self.last.len() == 0
+        return
+    self.feed = self.last.clone()
+    self.feed_pos = 0
+
+method Editor.scroll_page(&mut self, n: Int) -> Unit
+    h = self.text_h()
+    step = h - 2
+    if step < 1
+        step = 1
+    self.top = self.top + n * step
+    if self.top > self.last_row()
+        self.top = self.last_row()
+    if self.top < 0
+        self.top = 0
+    if n > 0
+        self.row = self.top
+    else
+        self.row = self.clamp_row(self.top + h - 1)
+    self.col = first_non_blank(self.buf.line(self.row))
+    self.update_want()
+
+method Editor.scroll_half(&mut self, dir: Int) -> Unit
+    half = self.text_h() / 2
+    if half < 1
+        half = 1
+    self.top = self.top + dir * half
+    if self.top > self.last_row()
+        self.top = self.last_row()
+    if self.top < 0
+        self.top = 0
+    self.row = self.clamp_row(self.row + dir * half)
+    self.col = first_non_blank(self.buf.line(self.row))
+    self.update_want()
+
+method Editor.scroll_line(&mut self, n: Int) -> Unit
+    self.top = self.top + n
+    if self.top > self.last_row()
+        self.top = self.last_row()
+    if self.top < 0
+        self.top = 0
+    h = self.text_h()
+    if self.row < self.top
+        self.row = self.top
+    if self.row >= self.top + h
+        self.row = self.top + h - 1
+    self.clamp()
+
+# ---------------------------------------------------------------- operadores
+
+method Editor.apply_motion(&mut self, op: Int, m: Motion) -> Unit ! alloc
+    if m.ok == 0
+        return
+    if m.linewise == 1
+        r1 = self.row
+        r2 = m.row
+        if r2 < r1
+            r1 = m.row
+            r2 = self.row
+        self.apply_lines(op, r1, r2)
+        return
+    sr = self.row
+    sc = self.col
+    er = m.row
+    ec = m.col
+    if er < sr || (er == sr && ec < sc)
+        sr = m.row
+        sc = m.col
+        er = self.row
+        ec = self.col
+    if m.inclusive == 1
+        ec = next_char(self.buf.line(er), ec)
+    elsif er > sr && ec == 0
+        # Exclusivo que acaba en la columna 0: termina en la línea anterior,
+        # y si empieza antes del primer no blanco pasa a ser por líneas.
+        er = er - 1
+        ec = self.buf.line(er).len()
+        if sc <= first_non_blank(self.buf.line(sr))
+            self.apply_lines(op, sr, er)
+            return
+    self.apply_chars(op, sr, sc, er, ec)
+
+method Editor.apply_lines(&mut self, op: Int, r1: Int, r2: Int) -> Unit ! alloc
+    nl = r2 - r1 + 1
+    if op == 121
+        self.reg = self.buf.text_lines(r1, r2)
+        self.reg_lines = 1
+        if r1 < self.row
+            self.row = r1
+            self.clamp()
+        if nl > 2
+            self.msg = nl.to_str() + " líneas copiadas"
+        return
+    if op == 100
+        self.begin_change()
+        self.reg = self.buf.text_lines(r1, r2)
+        self.reg_lines = 1
+        self.buf.delete_lines(r1, r2)
+        self.row = self.clamp_row(r1)
+        self.col = first_non_blank(self.buf.line(self.row))
+        self.update_want()
+        if nl > 2
+            self.msg = nl.to_str() + " líneas menos"
+        return
+    if op == 99
+        self.begin_change()
+        self.reg = self.buf.text_lines(r1, r2)
+        self.reg_lines = 1
+        ind = d""
+        if self.ai == 1
+            ind = leading_ws(self.buf.line(r1))
+        if r2 > r1
+            self.buf.delete_lines(r1 + 1, r2)
+        c = ind.len()
+        self.buf.set_line(r1, ind)
+        self.row = r1
+        self.col = c
+        self.start_insert(M_INSERT)
+        return
+    if op == 62 || op == 60
+        self.begin_change()
+        r = r1
+        while r <= r2
+            self.shift_line(r, op)
+            r = r + 1
+        self.row = r1
+        self.col = first_non_blank(self.buf.line(r1))
+        self.update_want()
+
+method Editor.shift_line(&mut self, r: Int, op: Int) -> Unit ! alloc
+    s = self.buf.line(r).clone()
+    if s.len() == 0
+        return
+    if op == 62
+        self.buf.set_line(r, self.indent_unit() + s)
+        return
+    i = 0
+    col = 0
+    while i < s.len() && col < self.sw
+        c = s.char(i)
+        if c == 9
+            col = self.sw
+            i = i + 1
+        elsif c == 32
+            col = col + 1
+            i = i + 1
+        else
+            col = self.sw
+    if i > 0
+        self.buf.set_line(r, s.slice(i, s.len()))
+
+method Editor.region_text(&self, sr: Int, sc: Int, er: Int, ec: Int) -> String ! alloc
+    if sr == er
+        return self.buf.line(sr).slice(sc, ec)
+    first = self.buf.line(sr)
+    out = first.slice(sc, first.len()) + "\n"
+    r = sr + 1
+    while r < er
+        out = out + self.buf.line(r) + "\n"
+        r = r + 1
+    out = out + self.buf.line(er).slice(0, ec)
+    out
+
+method Editor.apply_chars(&mut self, op: Int, sr: Int, sc: Int, er: Int, ec0: Int) -> Unit ! alloc
+    ec = ec0
+    if ec > self.buf.line(er).len()
+        ec = self.buf.line(er).len()
+    if op == 62 || op == 60
+        self.apply_lines(op, sr, er)
+        return
+    self.reg = self.region_text(sr, sc, er, ec)
+    self.reg_lines = 0
+    if op == 121
+        self.row = sr
+        self.col = sc
+        self.clamp()
+        self.update_want()
+        return
+    self.begin_change()
+    head = self.buf.line(sr).slice(0, sc)
+    tail = self.buf.line(er).slice(ec, self.buf.line(er).len())
+    self.buf.set_line(sr, head + tail)
+    if er > sr
+        self.buf.delete_lines(sr + 1, er)
+    self.row = sr
+    self.col = sc
+    if op == 99
+        self.start_insert(M_INSERT)
+    else
+        self.clamp()
+    self.update_want()
+
+method Editor.put(&mut self, after: Int, n: Int) -> Unit ! alloc
+    if self.reg.len() == 0
+        self.msg = d"E353: No hay nada en el registro"
+        return
+    self.begin_change()
+    txt = d""
+    i = 0
+    while i < n
+        txt = txt + self.reg
+        i = i + 1
+    if self.reg_lines == 1
+        xs = split_lines(&txt)
+        at = self.row
+        if after == 1
+            at = self.row + 1
+        self.buf.insert_lines(at, &xs)
+        self.row = at
+        self.col = first_non_blank(self.buf.line(at))
+        self.update_want()
+        return
+    s = self.buf.line(self.row).clone()
+    at = self.col
+    if after == 1 && s.len() > 0
+        at = next_char(&s, self.col)
+    parts = split_keep(&txt)
+    if parts.len() == 1
+        self.buf.set_line(self.row, s.slice(0, at) + txt + s.slice(at, s.len()))
+        self.col = prev_char(self.buf.line(self.row), at + txt.len())
+        self.update_want()
+        return
+    lastp = parts.len() - 1
+    first = s.slice(0, at) + parts.get(0)
+    tail = parts.get(lastp) + s.slice(at, s.len())
+    rest = List.new[String]()
+    j = 1
+    while j < lastp
+        rest.push(parts.get(j).clone())
+        j = j + 1
+    rest.push(tail)
+    self.buf.set_line(self.row, first)
+    self.buf.insert_lines(self.row + 1, &rest)
+    self.col = at
+    self.clamp()
+    self.update_want()
+
+method Editor.join_lines(&mut self, n: Int, spaced: Int) -> Unit ! alloc
+    times = n - 1
+    if times < 1
+        times = 1
+    if self.row >= self.last_row()
+        return
+    self.begin_change()
+    i = 0
+    pos = 0
+    while i < times && self.row < self.last_row()
+        a = self.buf.line(self.row).clone()
+        b = self.buf.line(self.row + 1).clone()
+        bt = b.clone()
+        sep = d""
+        if spaced == 1
+            bt = b.slice(first_ws_end(&b), b.len())
+            if a.len() > 0 && bt.len() > 0 && a.char(a.len() - 1) != 32 && bt.char(0) != 41
+                sep = d" "
+        pos = a.len()
+        self.buf.set_line(self.row, a + sep + bt)
+        self.buf.delete_lines(self.row + 1, self.row + 1)
+        i = i + 1
+    self.col = pos
+    self.clamp()
+    self.update_want()
+
+fn first_ws_end(s: &String) -> Int
+    i = 0
+    while i < s.len() && (s.char(i) == 32 || s.char(i) == 9)
+        i = i + 1
+    i
+
+method Editor.replace_chars(&mut self, k: Int, n: Int) -> Unit ! alloc
+    if k == K_ENTER || k < 32
+        return
+    s = self.buf.line(self.row).clone()
+    e = self.col
+    i = 0
+    while i < n && e < s.len()
+        e = next_char(&s, e)
+        i = i + 1
+    if i < n
+        return
+    self.begin_change()
+    ch = utf8_encode(k)
+    rep = d""
+    j = 0
+    while j < n
+        rep = rep + ch
+        j = j + 1
+    self.buf.set_line(self.row, s.slice(0, self.col) + rep + s.slice(e, s.len()))
+    self.col = prev_char(self.buf.line(self.row), self.col + rep.len())
+    self.update_want()
+
+method Editor.toggle_case(&mut self, n: Int) -> Unit ! alloc
+    s = self.buf.line(self.row).clone()
+    if s.len() == 0
+        return
+    e = self.col
+    i = 0
+    while i < n && e < s.len()
+        e = next_char(&s, e)
+        i = i + 1
+    self.begin_change()
+    self.buf.set_line(self.row, s.slice(0, self.col) + swap_case(&s.slice(self.col, e)) + s.slice(e, s.len()))
+    self.col = e
+    self.clamp()
+    self.update_want()
+
+method Editor.case_range(&mut self, sr: Int, sc: Int, er: Int, ec: Int, how: Int) -> Unit ! alloc
+    self.begin_change()
+    r = sr
+    while r <= er
+        s = self.buf.line(r).clone()
+        a = 0
+        b = s.len()
+        if r == sr
+            a = sc
+        if r == er && ec < b
+            b = ec
+        part = s.slice(a, b)
+        if how == 126
+            part = swap_case(&part)
+        elsif how == 117
+            part = lower(&part)
+        else
+            part = upper(&part)
+        self.buf.set_line(r, s.slice(0, a) + part + s.slice(b, s.len()))
+        r = r + 1
+    self.row = sr
+    self.col = sc
+    self.clamp()
+    self.update_want()
+
+fn map_case(s: &String, how: Int) -> String ! alloc
+    b = Bytes.new(s.len() + 1)
+    b.write_str(0, s)
+    i = 0
+    while i < s.len()
+        c = s.char(i)
+        if c >= 97 && c <= 122 && how != 1
+            b.set_u8(i, c - 32)
+        elsif c >= 65 && c <= 90 && how != 2
+            b.set_u8(i, c + 32)
+        i = i + 1
+    bytes_view(b, 0, s.len()).to_str()
+
+fn swap_case(s: &String) -> String ! alloc
+    map_case(s, 0)
+
+fn lower(s: &String) -> String ! alloc
+    map_case(s, 1)
+
+fn upper(s: &String) -> String ! alloc
+    map_case(s, 2)
+
+# ---------------------------------------------------------------- inserción
+
+method Editor.insert_key(&mut self, k: Int) -> Unit ! alloc
+    if k == K_ESC
+        self.mode = M_NORMAL
+        if self.col > 0
+            self.col = prev_char(self.buf.line(self.row), self.col)
+        self.clamp()
+        self.update_want()
+        return
+    if k == K_ENTER
+        self.insert_newline()
+    elsif k == K_BS || k == 8
+        self.backspace()
+    elsif k == K_DEL
+        self.delete_forward()
+    elsif k == K_TAB
+        if self.et == 1
+            self.insert_text(&spaces(self.ts - display_col(self.buf.line(self.row), self.col, self.ts) % self.ts))
+        else
+            self.insert_text(&d"\t")
+    elsif k == 23
+        self.delete_word_back()
+    elsif k == 21
+        if self.col > 0
+            self.begin_change()
+            s = self.buf.line(self.row).clone()
+            self.buf.set_line(self.row, s.slice(self.col, s.len()))
+            self.col = 0
+    elsif k == K_LEFT
+        if self.col > 0
+            self.col = prev_char(self.buf.line(self.row), self.col)
+    elsif k == K_RIGHT
+        self.col = next_char(self.buf.line(self.row), self.col)
+    elsif k == K_UP || k == K_DOWN
+        if k == K_UP && self.row > 0
+            self.row = self.row - 1
+        elsif k == K_DOWN && self.row < self.last_row()
+            self.row = self.row + 1
+        self.col = self.col_for_want(self.row)
+        self.clamp()
+        return
+    elsif k == K_HOME
+        self.col = 0
+    elsif k == K_END
+        self.col = self.buf.line(self.row).len()
+    elsif k >= 32 && k != 127 && is_special_key(k) == 0
+        t = utf8_encode(k)
+        if self.mode == M_REPLACE
+            self.overwrite(&t)
+        else
+            self.insert_text(&t)
+    self.update_want()
+
+method Editor.insert_text(&mut self, t: &String) -> Unit ! alloc
+    self.begin_change()
+    s = self.buf.line(self.row).clone()
+    self.buf.set_line(self.row, s.slice(0, self.col) + t + s.slice(self.col, s.len()))
+    self.col = self.col + t.len()
+
+method Editor.overwrite(&mut self, t: &String) -> Unit ! alloc
+    self.begin_change()
+    s = self.buf.line(self.row).clone()
+    e = next_char(&s, self.col)
+    self.buf.set_line(self.row, s.slice(0, self.col) + t + s.slice(e, s.len()))
+    self.col = self.col + t.len()
+
+method Editor.insert_newline(&mut self) -> Unit ! alloc
+    self.begin_change()
+    s = self.buf.line(self.row).clone()
+    head = s.slice(0, self.col)
+    tail = s.slice(self.col, s.len())
+    ind = d""
+    if self.ai == 1
+        ind = leading_ws(&head)
+        tail = tail.slice(first_ws_end(&tail), tail.len())
+    c = ind.len()
+    self.buf.set_line(self.row, head)
+    self.buf.insert_line(self.row + 1, ind + tail)
+    self.row = self.row + 1
+    self.col = c
+
+method Editor.backspace(&mut self) -> Unit ! alloc
+    if self.col > 0
+        self.begin_change()
+        s = self.buf.line(self.row).clone()
+        p = prev_char(&s, self.col)
+        self.buf.set_line(self.row, s.slice(0, p) + s.slice(self.col, s.len()))
+        self.col = p
+    elsif self.row > 0
+        self.begin_change()
+        prev = self.buf.line(self.row - 1).clone()
+        cur = self.buf.line(self.row).clone()
+        self.buf.set_line(self.row - 1, prev + cur)
+        self.buf.delete_lines(self.row, self.row)
+        self.row = self.row - 1
+        self.col = prev.len()
+
+method Editor.delete_forward(&mut self) -> Unit ! alloc
+    s = self.buf.line(self.row).clone()
+    if self.col < s.len()
+        self.begin_change()
+        e = next_char(&s, self.col)
+        self.buf.set_line(self.row, s.slice(0, self.col) + s.slice(e, s.len()))
+    elsif self.row < self.last_row()
+        self.begin_change()
+        nx = self.buf.line(self.row + 1).clone()
+        self.buf.set_line(self.row, s + nx)
+        self.buf.delete_lines(self.row + 1, self.row + 1)
+
+method Editor.delete_word_back(&mut self) -> Unit ! alloc
+    if self.col == 0
+        self.backspace()
+        return
+    s = self.buf.line(self.row).clone()
+    c = self.col
+    while c > 0 && char_class(s.char(prev_char(&s, c))) == 0
+        c = prev_char(&s, c)
+    if c > 0
+        k = char_class(s.char(prev_char(&s, c)))
+        while c > 0 && char_class(s.char(prev_char(&s, c))) == k
+            c = prev_char(&s, c)
+    self.begin_change()
+    self.buf.set_line(self.row, s.slice(0, c) + s.slice(self.col, s.len()))
+    self.col = c
+
+# ---------------------------------------------------------------- modo visual
+
+# Extremos de la selección, ordenados. Se devuelven en un `Motion`:
+# `row`/`col` es el inicio y `linewise`/`inclusive` la fila y columna del final.
+method Editor.visual_bounds(&self) -> Motion
+    if self.vrow < self.row || (self.vrow == self.row && self.vcol <= self.col)
+        Motion(1, self.vrow, self.vcol, self.row, self.col)
+    else
+        Motion(1, self.row, self.col, self.vrow, self.vcol)
+
+method Editor.visual_key(&mut self, k: Int) -> Unit ! io, alloc
+    if self.pending != 0
+        p = self.pending
+        self.pending = 0
+        if k == K_ESC || is_special_key(k) == 1
+            self.count = 0
+            return
+        n = self.cnt()
+        if p == 103 && k == 103
+            t = self.count - 1
+            if t < 0
+                t = 0
+            self.move_to(Motion.at(self.clamp_row(t), 0), k)
+        elsif p != 103
+            ch = key_text(k)
+            self.find_kind = p
+            self.find_ch = ch.clone()
+            m = self.find_motion(p, &ch, n)
+            if m.ok == 1
+                self.move_to(m, p)
+        self.count = 0
+        return
+    if (k >= 49 && k <= 57) || (k == 48 && self.count > 0)
+        if self.count < 10000000
+            self.count = self.count * 10 + k - 48
+        return
+    if k == K_ESC
+        self.mode = M_NORMAL
+        self.count = 0
+        self.clamp()
+        return
+    if k == 118 || k == 86
+        target = M_VISUAL
+        if k == 86
+            target = M_VLINE
+        if self.mode == target
+            self.mode = M_NORMAL
+            self.clamp()
+        else
+            self.mode = target
+        self.count = 0
+        return
+    if k == 111
+        r = self.vrow
+        c = self.vcol
+        self.vrow = self.row
+        self.vcol = self.col
+        self.row = r
+        self.col = c
+        return
+    if k == 103 || k == 102 || k == 70 || k == 116 || k == 84
+        self.pending = k
+        return
+    if k == 100 || k == 120 || k == 88 || k == 68 || k == 121 || k == 89 || k == 99 || k == 115 || k == 67 || k == 83 || k == 62 || k == 60 || k == 126 || k == 117 || k == 85 || k == 74 || k == 58 || k == 112
+        self.visual_op(k)
+        return
+    n = self.cnt()
+    m = self.motion(k, n, self.count)
+    if m.ok == 1
+        self.move_to(m, k)
+    self.count = 0
+
+method Editor.visual_op(&mut self, k: Int) -> Unit ! io, alloc
+    b = self.visual_bounds()
+    sr = b.row
+    sc = b.col
+    er = b.linewise
+    ec = b.inclusive
+    lines = 0
+    if self.mode == M_VLINE || k == 88 || k == 68 || k == 89 || k == 67 || k == 83
+        lines = 1
+    self.mode = M_NORMAL
+    self.count = 0
+    op = k
+    if k == 120 || k == 88 || k == 68
+        op = 100
+    elsif k == 89
+        op = 121
+    elsif k == 115 || k == 67 || k == 83
+        op = 99
+    if k == 58
+        self.open_cmdline(58, (sr + 1).to_str() + "," + (er + 1).to_str())
+        return
+    if k == 74
+        self.row = sr
+        self.join_lines(er - sr + 1, 1)
+        return
+    if k == 112
+        self.row = sr
+        self.col = sc
+        if lines == 1
+            self.apply_lines(100, sr, er)
+            self.put(0, 1)
+        else
+            saved = self.reg.clone()
+            saved_lines = self.reg_lines
+            self.apply_chars(100, sr, sc, er, next_char(self.buf.line(er), ec))
+            self.reg = saved
+            self.reg_lines = saved_lines
+            self.put(0, 1)
+        return
+    if k == 126 || k == 117 || k == 85
+        if lines == 1
+            self.case_range(sr, 0, er, self.buf.line(er).len(), k)
+        else
+            self.case_range(sr, sc, er, next_char(self.buf.line(er), ec), k)
+        return
+    if lines == 1 || op == 62 || op == 60
+        self.row = sr
+        self.apply_lines(op, sr, er)
+    else
+        self.apply_chars(op, sr, sc, er, next_char(self.buf.line(er), ec))
+
+# ---------------------------------------------------------------- línea de órdenes
+
+method Editor.open_cmdline(&mut self, kind: Int, init: String) -> Unit
+    self.mode = M_CMD
+    self.cmd_kind = kind
+    self.cmd = init
+    self.rec_skip = 1
+    self.reset_cmd()
+
+method Editor.cmdline_key(&mut self, k: Int) -> Unit ! io, alloc
+    if k == K_ESC
+        self.mode = M_NORMAL
+        self.cmd = d""
+        return
+    if k == K_ENTER
+        line = self.cmd.clone()
+        kind = self.cmd_kind
+        self.mode = M_NORMAL
+        self.cmd = d""
+        if kind == 58
+            self.ex(&line)
+        else
+            self.search_cmd(&line, kind)
+        return
+    if k == K_BS || k == 8
+        if self.cmd.len() == 0
+            self.mode = M_NORMAL
+        else
+            self.cmd = self.cmd.slice(0, prev_char(&self.cmd, self.cmd.len()))
+        return
+    if k == 21
+        self.cmd = d""
+        return
+    if k >= 32 && k != 127 && is_special_key(k) == 0
+        self.cmd = self.cmd + utf8_encode(k)
+
+# ---------------------------------------------------------------- búsqueda
+
+method Editor.search_cmd(&mut self, pat: &String, kind: Int) -> Unit ! alloc
+    if pat.len() > 0
+        self.search = pat.clone()
+    self.search_back = 0
+    if kind == 63
+        self.search_back = 1
+    self.search_word = 0
+    self.search_next(0)
+
+method Editor.match_ok(&self, s: &String, at: Int, plen: Int) -> Int
+    if self.search_word == 0
+        return 1
+    if at > 0 && char_class(s.char(at - 1)) == 1
+        return 0
+    if at + plen < s.len() && char_class(s.char(at + plen)) == 1
+        return 0
+    1
+
+method Editor.find_from(&self, s: &String, start: Int) -> Int
+    if start > s.len()
+        return -1
+    at = s.index_from(&self.search, start)
+    while at >= 0 && self.match_ok(s, at, self.search.len()) == 0
+        at = s.index_from(&self.search, at + 1)
+    at
+
+method Editor.find_before(&self, s: &String, limit: Int) -> Int
+    found = -1
+    at = self.find_from(s, 0)
+    while at >= 0 && at < limit
+        found = at
+        at = self.find_from(s, at + 1)
+    found
+
+method Editor.search_next(&mut self, reverse: Int) -> Unit ! alloc
+    if self.search.len() == 0
+        self.msg = d"E35: No hay búsqueda anterior"
+        return
+    back = self.search_back
+    if reverse == 1
+        back = 1 - back
+    total = self.buf.count()
+    r = self.row
+    wrapped = 0
+    i = 0
+    found = -1
+    if back == 0
+        start = self.col + 1
+        while i <= total && found < 0
+            found = self.find_from(self.buf.line(r), start)
+            if found < 0
+                r = r + 1
+                start = 0
+                if r >= total
+                    r = 0
+                    wrapped = 1
+            i = i + 1
+    else
+        limit = self.col
+        while i <= total && found < 0
+            found = self.find_before(self.buf.line(r), limit)
+            if found < 0
+                r = r - 1
+                limit = WANT_END
+                if r < 0
+                    r = total - 1
+                    wrapped = 1
+            i = i + 1
+    if found < 0
+        self.msg = "E486: Patrón no encontrado: " + self.search
+        return
+    self.row = r
+    self.col = found
+    self.clamp()
+    self.update_want()
+    if wrapped == 1
+        if back == 0
+            self.msg = d"búsqueda llegó al FINAL, sigue por el PRINCIPIO"
+        else
+            self.msg = d"búsqueda llegó al PRINCIPIO, sigue por el FINAL"
+    else
+        prefix = d"/"
+        if back == 1
+            prefix = d"?"
+        self.msg = prefix + self.search
+
+method Editor.search_word_under(&mut self, k: Int) -> Unit ! alloc
+    s = self.buf.line(self.row).clone()
+    c = self.col
+    while c < s.len() && char_class(s.char(c)) != 1
+        c = c + 1
+    if c >= s.len()
+        self.msg = d"E348: No hay ninguna palabra bajo el cursor"
+        return
+    a = c
+    while a > 0 && char_class(s.char(a - 1)) == 1
+        a = a - 1
+    b = c
+    while b < s.len() && char_class(s.char(b)) == 1
+        b = b + 1
+    self.search = s.slice(a, b)
+    self.search_word = 1
+    self.search_back = 0
+    if k == 35
+        self.search_back = 1
+    self.col = a
+    self.search_next(0)
+
+# ---------------------------------------------------------------- órdenes `:`
+
+method Editor.parse_addr(&self, s: &String) -> Int
+    if s.len() == 0
+        return -1
+    if s.char(0) == 46
+        return self.row
+    if s.char(0) == 36
+        return self.last_row()
+    if is_digit(s.char(0)) == 1
+        return self.clamp_row(parse_int(s) - 1)
+    return -1
+
+method Editor.ex(&mut self, line: &String) -> Unit ! io, alloc
+    s = trim(line)
+    if s.len() == 0
+        return
+    r1 = -1
+    r2 = -1
+    i = 0
+    if s.char(0) == 37
+        r1 = 0
+        r2 = self.last_row()
+        i = 1
+    else
+        while i < s.len() && (is_digit(s.char(i)) == 1 || s.char(i) == 46 || s.char(i) == 36 || s.char(i) == 44)
+            i = i + 1
+        spec = s.slice(0, i)
+        comma = spec.index_of(&d",")
+        if comma >= 0
+            r1 = self.parse_addr(&spec.slice(0, comma))
+            r2 = self.parse_addr(&spec.slice(comma + 1, spec.len()))
+            if r1 < 0
+                r1 = self.row
+            if r2 < 0
+                r2 = self.row
+        else
+            r1 = self.parse_addr(&spec)
+            r2 = r1
+    if r1 > r2
+        t = r1
+        r1 = r2
+        r2 = t
+    j = i
+    while j < s.len() && ((s.char(j) >= 97 && s.char(j) <= 122) || (s.char(j) >= 65 && s.char(j) <= 90))
+        j = j + 1
+    name = s.slice(i, j)
+    bang = 0
+    if j < s.len() && s.char(j) == 33
+        bang = 1
+        j = j + 1
+    rest = s.slice(j, s.len())
+    arg = trim(&rest)
+    if name.len() == 0
+        if r2 >= 0
+            self.row = r2
+            self.col = first_non_blank(self.buf.line(r2))
+            self.update_want()
+        else
+            self.msg = "E492: No es una orden del editor: " + s
+        return
+    if r1 < 0
+        r1 = self.row
+        r2 = self.row
+    match name
+        "w" =>
+            _w = self.write_file(&arg)
+        "write" =>
+            _w = self.write_file(&arg)
+        "wq" =>
+            if self.write_file(&arg) == 1
+                self.quit = 1
+        "x" =>
+            self.write_and_quit(&arg)
+        "xit" =>
+            self.write_and_quit(&arg)
+        "exit" =>
+            self.write_and_quit(&arg)
+        "q" =>
+            self.quit_cmd(bang)
+        "quit" =>
+            self.quit_cmd(bang)
+        "qa" =>
+            self.quit_cmd(bang)
+        "qall" =>
+            self.quit_cmd(bang)
+        "e" =>
+            self.edit_file(&arg, bang)
+        "edit" =>
+            self.edit_file(&arg, bang)
+        "r" =>
+            self.read_into(&arg, r2)
+        "read" =>
+            self.read_into(&arg, r2)
+        "s" =>
+            self.substitute(&rest, r1, r2)
+        "substitute" =>
+            self.substitute(&rest, r1, r2)
+        "d" =>
+            self.apply_lines(100, r1, r2)
+        "delete" =>
+            self.apply_lines(100, r1, r2)
+        "y" =>
+            self.apply_lines(121, r1, r2)
+        "yank" =>
+            self.apply_lines(121, r1, r2)
+        "j" =>
+            self.row = r1
+            self.join_lines(r2 - r1 + 1, 1)
+        "join" =>
+            self.row = r1
+            self.join_lines(r2 - r1 + 1, 1)
+        "set" =>
+            self.set_options(&arg)
+        "se" =>
+            self.set_options(&arg)
+        "noh" =>
+            self.msg = d""
+        "nohlsearch" =>
+            self.msg = d""
+        "h" =>
+            self.help()
+        "help" =>
+            self.help()
+        _ =>
+            self.msg = "E492: No es una orden del editor: " + s
+
+method Editor.help(&mut self) -> Unit ! alloc
+    self.msg = d":w [f] :q[!] :wq :x :e[!] f :r f :N :[r]s/a/b/g :[r]d :set nu ts= sw= et ai — i a o O v V R u ^R . / ? n * p"
+
+method Editor.write_file(&mut self, arg: &String) -> Int ! io, alloc
+    path = arg.clone()
+    if path.len() == 0
+        path = self.buf.path.clone()
+    if path.len() == 0
+        self.msg = d"E32: Falta el nombre del fichero"
+        return 0
+    rc = self.buf.save_to(&path)
+    if rc < 0
+        self.msg = "E212: No se puede abrir para escribir: " + path
+        return 0
+    if self.buf.path.len() == 0
+        self.buf.path = path.clone()
+    if path.eq(self.buf.path.clone()) == 1
+        self.buf.dirty = 0
+    self.msg = "\"" + path + "\" " + self.buf.count().to_str() + "L, " + self.buf.byte_count().to_str() + "B escritos"
+    1
+
+method Editor.write_and_quit(&mut self, arg: &String) -> Unit ! io, alloc
+    if self.buf.dirty == 0 && arg.len() == 0
+        self.quit = 1
+    elsif self.write_file(arg) == 1
+        self.quit = 1
+
+method Editor.quit_cmd(&mut self, bang: Int) -> Unit ! alloc
+    if self.buf.dirty == 1 && bang == 0
+        self.msg = d"E37: No se ha escrito desde el último cambio (añade ! para salir)"
+    else
+        self.quit = 1
+
+method Editor.edit_file(&mut self, arg: &String, bang: Int) -> Unit ! io, alloc
+    if self.buf.dirty == 1 && bang == 0
+        self.msg = d"E37: No se ha escrito desde el último cambio (añade ! para descartarlo)"
+        return
+    path = arg.clone()
+    if path.len() == 0
+        path = self.buf.path.clone()
+    if path.len() == 0
+        self.msg = d"E32: Falta el nombre del fichero"
+        return
+    self.buf = load_file(&path)
+    self.row = 0
+    self.col = 0
+    self.top = 0
+    self.left = 0
+    self.want = 0
+    self.undo = List.new[String]()
+    self.undo_pos = List.new[Int]()
+    self.redo = List.new[String]()
+    self.redo_pos = List.new[Int]()
+    self.msg = self.file_info()
+
+method Editor.read_into(&mut self, arg: &String, r: Int) -> Unit ! io, alloc
+    if arg.len() == 0
+        self.msg = d"E32: Falta el nombre del fichero"
+        return
+    other = load_file(arg)
+    if other.dirty == 0 && other.count() == 1 && other.line(0).len() == 0
+        self.msg = "E484: No se puede abrir " + arg
+        return
+    self.begin_change()
+    self.buf.insert_lines(r + 1, &other.lines)
+    self.row = r + 1
+    self.col = first_non_blank(self.buf.line(self.row))
+    self.update_want()
+
+method Editor.substitute(&mut self, body: &String, r1: Int, r2: Int) -> Unit ! alloc
+    b = trim(body)
+    if b.len() == 0
+        self.msg = d"E35: Falta el patrón"
+        return
+    pat = subst_part(&b, 0)
+    rep = subst_part(&b, 1)
+    flags = subst_part(&b, 2)
+    all = 0
+    if flags.index_of(&d"g") >= 0
+        all = 1
+    if pat.len() == 0
+        pat = self.search.clone()
+    if pat.len() == 0
+        self.msg = d"E35: No hay búsqueda anterior"
+        return
+    self.search = pat.clone()
+    self.search_word = 0
+    total = 0
+    nlines = 0
+    lastr = -1
+    r = r1
+    while r <= r2
+        n = count_occ(self.buf.line(r), &pat, all)
+        if n > 0
+            self.begin_change()
+            ns = replace_str(self.buf.line(r), &pat, &rep, all)
+            self.buf.set_line(r, ns)
+            total = total + n
+            nlines = nlines + 1
+            lastr = r
+        r = r + 1
+    if total == 0
+        self.msg = "E486: Patrón no encontrado: " + pat
+        return
+    self.row = lastr
+    self.col = first_non_blank(self.buf.line(lastr))
+    self.update_want()
+    if total > 1
+        self.msg = total.to_str() + " sustituciones en " + nlines.to_str() + " líneas"
+
+method Editor.set_options(&mut self, arg: &String) -> Unit ! io, alloc
+    if arg.len() == 0
+        self.msg = "ts=" + self.ts.to_str() + " sw=" + self.sw.to_str() + " lines=" + self.term.rows.to_str() + " columns=" + self.term.cols.to_str()
+        if self.number == 1
+            self.msg = self.msg + " number"
+        if self.et == 1
+            self.msg = self.msg + " expandtab"
+        if self.ai == 1
+            self.msg = self.msg + " autoindent"
+        return
+    i = 0
+    while i < arg.len()
+        w = word_at(arg, i)
+        if w.len() == 0
+            break
+        i = arg.index_from(&w, i) + w.len()
+        self.set_option(&w)
+
+method Editor.set_option(&mut self, w: &String) -> Unit ! io, alloc
+    eq = w.index_of(&d"=")
+    if eq >= 0
+        key = w.slice(0, eq)
+        v = parse_int(&w.slice(eq + 1, w.len()))
+        if v <= 0
+            self.msg = "E521: Hace falta un número: " + w
+            return
+        match key
+            "ts" =>
+                self.ts = v
+            "tabstop" =>
+                self.ts = v
+            "sw" =>
+                self.sw = v
+            "shiftwidth" =>
+                self.sw = v
+            "lines" =>
+                self.term.rows = v
+                self.term.write(&csi(&d"2J"))
+            "columns" =>
+                self.term.cols = v
+                self.term.write(&csi(&d"2J"))
+            _ =>
+                self.msg = "E518: Opción desconocida: " + key
+        return
+    match w
+        "nu" =>
+            self.number = 1
+        "number" =>
+            self.number = 1
+        "nonu" =>
+            self.number = 0
+        "nonumber" =>
+            self.number = 0
+        "et" =>
+            self.et = 1
+        "expandtab" =>
+            self.et = 1
+        "noet" =>
+            self.et = 0
+        "noexpandtab" =>
+            self.et = 0
+        "ai" =>
+            self.ai = 1
+        "autoindent" =>
+            self.ai = 1
+        "noai" =>
+            self.ai = 0
+        "noautoindent" =>
+            self.ai = 0
+        _ =>
+            self.msg = "E518: Opción desconocida: " + w
+
+# ---------------------------------------------------------------- pantalla
+
+method Editor.scroll_into_view(&mut self, h: Int, w: Int) -> Unit
+    if self.row < self.top
+        self.top = self.row
+    if self.row >= self.top + h
+        self.top = self.row - h + 1
+    dc = display_col(self.buf.line(self.row), self.col, self.ts)
+    if dc < self.left
+        self.left = dc
+    if dc >= self.left + w
+        self.left = dc - w + 1
+
+method Editor.render(&mut self) -> Unit ! io, alloc
+    h = self.text_h()
+    total = self.buf.count()
+    cols = self.term.cols
+    numw = 0
+    if self.number == 1
+        numw = digits(total)
+        if numw < 3
+            numw = 3
+        numw = numw + 1
+    w = cols - numw
+    if w < 1
+        w = 1
+    self.scroll_into_view(h, w)
+    vis = 0
+    b = Motion.at(0, 0)
+    if self.mode == M_VISUAL || self.mode == M_VLINE
+        vis = 1
+        b = self.visual_bounds()
+    out = csi(&"?25l") + csi(&d"H")
+    y = 0
+    while y < h
+        r = self.top + y
+        if r < total
+            if numw > 0
+                out = out + csi(&"33m") + pad_left(&(r + 1).to_str(), numw - 1) + " " + csi(&d"0m")
+            s = self.buf.line(r)
+            hs = 0
+            he = 0
+            if vis == 1 && r >= b.row && r <= b.linewise
+                he = s.len() + 1
+                if self.mode == M_VISUAL
+                    if r == b.row
+                        hs = b.col
+                    if r == b.linewise
+                        he = next_char(s, b.inclusive)
+                        if he <= hs
+                            he = hs + 1
+            out = out + render_line(s, self.left, w, self.ts, hs, he)
+        else
+            out = out + csi(&"34m") + "~" + csi(&d"0m")
+        out = out + csi(&"K") + "\r\n"
+        y = y + 1
+    out = out + csi(&"7m") + self.status_line(cols) + csi(&"27m") + csi(&"K") + "\r\n"
+    out = out + fit(&self.bottom_line(), cols - 1) + csi(&d"K")
+    cy = self.row - self.top + 1
+    cx = numw + display_col(self.buf.line(self.row), self.col, self.ts) - self.left + 1
+    if self.mode == M_CMD
+        cy = h + 2
+        cx = 2 + display_col(&self.cmd, self.cmd.len(), 8)
+        if cx > cols
+            cx = cols
+    out = out + csi(&(cy.to_str() + ";" + cx.to_str() + "H")) + csi(&d"?25h")
+    self.term.write(&out)
+
+method Editor.status_line(&self, cols: Int) -> String ! alloc
+    name = self.buf.path.clone()
+    if name.len() == 0
+        name = d"[Sin nombre]"
+    left = " " + name
+    if self.buf.dirty == 1
+        left = left + " [+]"
+    right = (self.row + 1).to_str() + "," + (self.col + 1).to_str() + "  " + self.percent().to_str() + "% "
+    room = cols - str_width(&right)
+    if room < 0
+        room = 0
+    fit(&left, room) + right
+
+method Editor.bottom_line(&self) -> String ! alloc
+    if self.mode == M_CMD
+        return String.from_char(self.cmd_kind) + self.cmd
+    if self.msg.len() > 0
+        return self.msg.clone()
+    if self.mode == M_INSERT
+        return d"-- INSERTAR --"
+    if self.mode == M_REPLACE
+        return d"-- REEMPLAZAR --"
+    if self.mode == M_VISUAL
+        return d"-- VISUAL --"
+    if self.mode == M_VLINE
+        return d"-- VISUAL LÍNEA --"
+    d""

@@ -1,0 +1,137 @@
+# Terminal: modo crudo, tamaño y escritura.
+#
+# En Linux la tty arranca en modo canónico con eco: se pasa a crudo con
+# `stty raw -echo` (heredando la tty como stdin) y se restaura con la
+# configuración guardada por `stty -g`. En soso la tty ya entrega los bytes
+# sin eco ni búfer de línea, y no hay `stty`: si no se puede lanzar, se da
+# por hecho que la consola ya es cruda.
+import "io/abi.sal"
+import "io/env.sal"
+import "io/io.sal"
+import "io/pipe.sal"
+import "io/process.sal"
+
+struct Terminal
+    linux: Int
+    saved: String
+    rows: Int
+    cols: Int
+
+static Terminal.open() -> Terminal ! io, alloc
+    saved = stty_capture(&d"-g")
+    linux = 0
+    if saved.len() > 0
+        linux = 1
+    t = Terminal(linux, saved, 24, 80)
+    t.measure()
+    t
+
+# Filas y columnas: `stty size` en Linux; si no, `LINES`/`COLUMNS`; si no, 24x80.
+method Terminal.measure(&mut self) -> Unit ! io, alloc
+    rows = 0
+    cols = 0
+    if self.linux == 1
+        sz = stty_capture(&d"size")
+        sp = sz.index_of(&d" ")
+        if sp > 0
+            rows = parse_uint(&sz.slice(0, sp))
+            cols = parse_uint(&sz.slice(sp + 1, sz.len()))
+    if rows <= 0
+        rows = parse_uint(&getenv(&d"LINES"))
+    if cols <= 0
+        cols = parse_uint(&getenv(&d"COLUMNS"))
+    if rows < 3
+        rows = 24
+    if cols < 10
+        cols = 80
+    self.rows = rows
+    self.cols = cols
+
+method Terminal.enter(&self) -> Unit ! io, alloc
+    if self.linux == 1
+        stty_run(&d"raw", &d"-echo")
+    self.write(&(csi(&"?1049h") + csi(&"H") + csi(&d"2J")))
+
+method Terminal.leave(&self) -> Unit ! io, alloc
+    self.write(&(csi(&"0m") + csi(&"2J") + csi(&"H") + csi(&"?25h") + csi(&d"?1049l")))
+    if self.linux == 1
+        stty_run(&self.saved, &d"")
+
+# Escribe todo `s` en stdout, aunque `write` acepte menos de una vez.
+method Terminal.write(&self, s: &String) -> Unit ! io, alloc
+    n = s.len()
+    if n > 0
+        buf = Bytes.new(n)
+        buf.write_str(0, s)
+        off = 0
+        fallos = 0
+        while off < n && fallos < 100
+            w = Fd.new(1).write(buf.ptr() + off, n - off)
+            if w > 0
+                off = off + w
+            else
+                fallos = fallos + 1
+
+fn esc() -> String ! alloc
+    String.from_char(27)
+
+fn csi(s: &String) -> String ! alloc
+    esc() + "[" + s
+
+fn parse_uint(s: &String) -> Int
+    n = 0
+    i = 0
+    ok = 0
+    while i < s.len()
+        c = s.char(i)
+        if c >= 48 && c <= 57
+            n = n * 10 + c - 48
+            ok = 1
+        elsif ok == 1
+            break
+        i = i + 1
+    n
+
+# Lanza `stty` con uno o dos argumentos y la tty heredada como stdin.
+fn stty_run(a1: &String, a2: &String) -> Int ! io, alloc
+    pid = stty_spawn(a1, a2, SPAWN_FD_INHERIT)
+    if pid < 0
+        pid
+    else
+        wait_pid(pid)
+
+fn stty_spawn(a1: &String, a2: &String, out: Int) -> Int ! io, alloc
+    path = d"stty"
+    pbuf = spawn_string_buf(&path)
+    b1 = spawn_string_buf(a1)
+    b2 = spawn_string_buf(a2)
+    tab = Bytes.new(48)
+    spawn_argv_slot_ptr(&tab, 0, &pbuf, path.len())
+    spawn_argv_slot_ptr(&tab, 1, &b1, a1.len())
+    argc = 2
+    if a2.len() > 0
+        spawn_argv_slot_ptr(&tab, 2, &b2, a2.len())
+        argc = 3
+    spawn_io_argv(&path, argc, &tab, SPAWN_FD_INHERIT, out, SPAWN_FD_CLOSED, &d"", 0)
+
+# Salida de `stty <arg>` sin el salto final; "" si no hay `stty` o falla.
+fn stty_capture(arg: &String) -> String ! io, alloc
+    pp = Pipe.create()
+    rd = pp.read_fd()
+    wr = pp.write_fd()
+    if rd < 0 || wr < 0 || wr > 4096
+        return d""
+    pid = stty_spawn(arg, &d"", wr)
+    Fd.new(wr).close()
+    if pid < 0
+        Fd.new(rd).close()
+        return d""
+    out = read_fd_all_go(rd, 4096)
+    Fd.new(rd).close()
+    st = wait_pid(pid)
+    if Wait.from_raw(st).exit_code() != 0
+        return d""
+    n = out.len()
+    while n > 0 && (out.char(n - 1) == 10 || out.char(n - 1) == 13)
+        n = n - 1
+    out.slice(0, n)

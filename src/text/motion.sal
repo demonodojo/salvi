@@ -1,0 +1,234 @@
+# Movimientos de vi sobre un `Buffer`. Cada uno devuelve un `Motion`: la
+# posición de destino y cómo la toma un operador (por líneas, inclusivo).
+import "buffer.sal"
+import "utf8.sal"
+
+struct Motion
+    ok: Int
+    row: Int
+    col: Int
+    linewise: Int
+    inclusive: Int
+
+static Motion.at(row: Int, col: Int) -> Motion
+    Motion(1, row, col, 0, 0)
+
+static Motion.none() -> Motion
+    Motion(0, 0, 0, 0, 0)
+
+method Motion.lines(self) -> Motion
+    Motion(self.ok, self.row, self.col, 1, self.inclusive)
+
+method Motion.incl(self) -> Motion
+    Motion(self.ok, self.row, self.col, self.linewise, 1)
+
+fn cls_of(c: Int, big: Int) -> Int
+    if big == 1
+        char_class_big(c)
+    else
+        char_class(c)
+
+# `w` / `W`: inicio de la palabra siguiente. Al final del buffer, la columna
+# es la longitud de la última línea (el operador llega hasta el final).
+fn word_fwd(buf: &Buffer, row: Int, col: Int, big: Int) -> Motion
+    r = row
+    c = col
+    s = buf.line(r)
+    n = s.len()
+    if c < n
+        k = cls_of(s.char(c), big)
+        if k != 0
+            while c < n && cls_of(s.char(c), big) == k
+                c = next_char(s, c)
+    while true
+        while c < n && cls_of(s.char(c), big) == 0
+            c = next_char(s, c)
+        if c < n
+            return Motion.at(r, c)
+        if r + 1 >= buf.count()
+            return Motion.at(r, n)
+        r = r + 1
+        s = buf.line(r)
+        n = s.len()
+        c = 0
+        if n == 0
+            return Motion.at(r, 0)
+    Motion.at(r, c)
+
+# `e` / `E`: final de la palabra (inclusivo).
+fn word_end(buf: &Buffer, row: Int, col: Int, big: Int) -> Motion
+    r = row
+    s = buf.line(r)
+    n = s.len()
+    c = next_char(s, col)
+    while true
+        while c < n && cls_of(s.char(c), big) == 0
+            c = next_char(s, c)
+        if c < n
+            break
+        if r + 1 >= buf.count()
+            return Motion.at(r, last_char(s)).incl()
+        r = r + 1
+        s = buf.line(r)
+        n = s.len()
+        c = 0
+    k = cls_of(s.char(c), big)
+    while true
+        nx = next_char(s, c)
+        if nx >= n || cls_of(s.char(nx), big) != k
+            break
+        c = nx
+    Motion.at(r, c).incl()
+
+# `b` / `B`: inicio de la palabra anterior.
+fn word_back(buf: &Buffer, row: Int, col: Int, big: Int) -> Motion
+    r = row
+    s = buf.line(r)
+    n = s.len()
+    c = col
+    if c > n
+        c = n
+    if c == 0
+        if r == 0
+            return Motion.at(0, 0)
+        r = r - 1
+        s = buf.line(r)
+        n = s.len()
+        if n == 0
+            return Motion.at(r, 0)
+        c = last_char(s)
+    else
+        c = prev_char(s, c)
+    while cls_of(s.char(c), big) == 0
+        if c == 0
+            if r == 0
+                return Motion.at(0, 0)
+            r = r - 1
+            s = buf.line(r)
+            n = s.len()
+            if n == 0
+                return Motion.at(r, 0)
+            c = last_char(s)
+        else
+            c = prev_char(s, c)
+    k = cls_of(s.char(c), big)
+    while c > 0
+        p = prev_char(s, c)
+        if cls_of(s.char(p), big) != k
+            break
+        c = p
+    Motion.at(r, c)
+
+# `}`: siguiente línea vacía tras un bloque de texto (o el final).
+fn para_fwd(buf: &Buffer, row: Int) -> Motion
+    r = row
+    last = buf.count() - 1
+    while r < last && buf.line(r).len() == 0
+        r = r + 1
+    while r < last && buf.line(r).len() > 0
+        r = r + 1
+    if r == last && buf.line(r).len() > 0
+        return Motion.at(r, last_char(buf.line(r))).incl()
+    Motion.at(r, 0)
+
+# `{`: línea vacía anterior (o el principio).
+fn para_back(buf: &Buffer, row: Int) -> Motion
+    r = row
+    while r > 0 && buf.line(r).len() == 0
+        r = r - 1
+    while r > 0 && buf.line(r).len() > 0
+        r = r - 1
+    Motion.at(r, 0)
+
+# `f` / `t` (hacia delante) y `F` / `T` (hacia atrás) en la línea.
+fn find_in_line(s: &String, col: Int, ch: &String, kind: Int, count: Int) -> Int
+    c = col
+    k = 0
+    if kind == 102 || kind == 116
+        start = next_char(s, c)
+        while k < count
+            at = s.index_from(ch, start)
+            if at < 0
+                return -1
+            c = at
+            start = next_char(s, at)
+            k = k + 1
+        if kind == 116
+            c = prev_char(s, c)
+        return c
+    pos = c
+    while k < count
+        found = -1
+        j = 0
+        while j < pos
+            at = s.index_from(ch, j)
+            if at < 0 || at >= pos
+                break
+            found = at
+            j = at + 1
+        if found < 0
+            return -1
+        pos = found
+        k = k + 1
+    if kind == 84
+        pos = next_char(s, pos)
+    pos
+
+fn bracket_pair(c: Int) -> Int
+    match c
+        40 => 41
+        41 => 40
+        91 => 93
+        93 => 91
+        123 => 125
+        125 => 123
+        _ => 0
+
+fn is_open_bracket(c: Int) -> Int
+    if c == 40 || c == 91 || c == 123
+        1
+    else
+        0
+
+# `%`: pareja del primer paréntesis en o tras el cursor en la línea.
+fn match_pair(buf: &Buffer, row: Int, col: Int) -> Motion
+    s = buf.line(row)
+    c = col
+    while c < s.len() && bracket_pair(s.char(c)) == 0
+        c = c + 1
+    if c >= s.len()
+        return Motion.none()
+    open = s.char(c)
+    close = bracket_pair(open)
+    depth = 0
+    r = row
+    if is_open_bracket(open) == 1
+        while r < buf.count()
+            t = buf.line(r)
+            while c < t.len()
+                x = t.char(c)
+                if x == open
+                    depth = depth + 1
+                elsif x == close
+                    depth = depth - 1
+                    if depth == 0
+                        return Motion.at(r, c).incl()
+                c = c + 1
+            r = r + 1
+            c = 0
+        return Motion.none()
+    while r >= 0
+        t = buf.line(r)
+        if c < 0
+            c = t.len() - 1
+        while c >= 0
+            x = t.char(c)
+            if x == open
+                depth = depth + 1
+            elsif x == close
+                depth = depth - 1
+                if depth == 0
+                    return Motion.at(r, c).incl()
+            c = c - 1
+        r = r - 1
+    Motion.none()

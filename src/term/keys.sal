@@ -1,0 +1,45 @@
+# Códigos de tecla. 0..127 son los bytes ASCII tal cual (Ctrl-X es X & 31);
+# de 128 a 0x10FFFF, el punto de código Unicode del carácter tecleado;
+# por encima, las teclas especiales.
+K_NONE = -1
+
+K_EOF = -2
+
+K_ESC = 27
+
+K_ENTER = 13
+
+K_TAB = 9
+
+K_BS = 127
+
+K_CTRL_H = 8
+
+K_UP = 1114113
+
+K_DOWN = 1114114
+
+K_RIGHT = 1114115
+
+K_LEFT = 1114116
+
+K_HOME = 1114117
+
+K_END = 1114118
+
+K_DEL = 1114119
+
+K_PGUP = 1114120
+
+K_PGDN = 1114121
+
+K_INS = 1114122
+
+fn ctrl(c: Int) -> Int
+    c & 31
+
+fn is_special_key(k: Int) -> Int
+    if k > 1114111 || k < 0
+        1
+    else
+        0

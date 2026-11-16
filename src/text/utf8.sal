@@ -1,0 +1,146 @@
+# Ayudas de texto sobre bytes UTF-8. Las columnas del cursor son índices de
+# byte; un carácter ocupa una columna de pantalla salvo el tabulador.
+
+fn is_cont(c: Int) -> Int
+    if c >= 128 && c < 192
+        1
+    else
+        0
+
+# Byte donde empieza el carácter siguiente al que empieza en `i`.
+fn next_char(s: &String, i: Int) -> Int
+    n = s.len()
+    if i >= n
+        return n
+    j = i + 1
+    while j < n && is_cont(s.char(j)) == 1
+        j = j + 1
+    j
+
+# Byte donde empieza el carácter anterior a `i`.
+fn prev_char(s: &String, i: Int) -> Int
+    if i <= 0
+        return 0
+    j = i - 1
+    while j > 0 && is_cont(s.char(j)) == 1
+        j = j - 1
+    j
+
+# Inicio del carácter que contiene el byte `i` (ajusta a un límite válido).
+fn char_start(s: &String, i: Int) -> Int
+    n = s.len()
+    if i >= n
+        return n
+    j = i
+    while j > 0 && is_cont(s.char(j)) == 1
+        j = j - 1
+    j
+
+# Inicio del último carácter de la línea (0 si está vacía).
+fn last_char(s: &String) -> Int
+    prev_char(s, s.len())
+
+# Columna de pantalla del byte `i`, con tabuladores de ancho `ts`.
+fn display_col(s: &String, i: Int, ts: Int) -> Int
+    col = 0
+    j = 0
+    while j < i && j < s.len()
+        c = s.char(j)
+        if c == 9
+            col = col + ts - col % ts
+        elsif is_cont(c) == 0
+            col = col + 1
+        j = j + 1
+    col
+
+# Byte del carácter que cubre la columna de pantalla `want`.
+fn byte_at_col(s: &String, want: Int, ts: Int) -> Int
+    col = 0
+    j = 0
+    n = s.len()
+    while j < n
+        c = s.char(j)
+        w = 1
+        if c == 9
+            w = ts - col % ts
+        if col + w > want
+            return j
+        col = col + w
+        j = next_char(s, j)
+    n
+
+# Punto de código → cadena UTF-8.
+fn utf8_encode(cp: Int) -> String ! alloc
+    if cp < 128
+        return String.from_char(cp)
+    b = Bytes.new(4)
+    n = 0
+    if cp < 2048
+        b.set_u8(0, 192 | (cp >> 6))
+        b.set_u8(1, 128 | (cp & 63))
+        n = 2
+    elsif cp < 65536
+        b.set_u8(0, 224 | (cp >> 12))
+        b.set_u8(1, 128 | ((cp >> 6) & 63))
+        b.set_u8(2, 128 | (cp & 63))
+        n = 3
+    else
+        b.set_u8(0, 240 | (cp >> 18))
+        b.set_u8(1, 128 | ((cp >> 12) & 63))
+        b.set_u8(2, 128 | ((cp >> 6) & 63))
+        b.set_u8(3, 128 | (cp & 63))
+        n = 4
+    bytes_view(b, 0, n).to_str()
+
+# Clase de carácter para las palabras de vi: 0 blanco, 1 palabra, 2 puntuación.
+fn char_class(c: Int) -> Int
+    if c == 32 || c == 9
+        0
+    elsif c >= 128
+        1
+    elsif c == 95
+        1
+    elsif c >= 48 && c <= 57
+        1
+    elsif c >= 65 && c <= 90
+        1
+    elsif c >= 97 && c <= 122
+        1
+    else
+        2
+
+# Clase para WORD (W, B, E): todo lo que no es blanco es palabra.
+fn char_class_big(c: Int) -> Int
+    if c == 32 || c == 9
+        0
+    else
+        1
+
+fn leading_ws(s: &String) -> String ! alloc
+    i = 0
+    while i < s.len() && (s.char(i) == 32 || s.char(i) == 9)
+        i = i + 1
+    s.slice(0, i)
+
+fn first_non_blank(s: &String) -> Int
+    i = 0
+    while i < s.len() && (s.char(i) == 32 || s.char(i) == 9)
+        i = i + 1
+    if i >= s.len()
+        last_char(s)
+    else
+        i
+
+fn spaces(n: Int) -> String ! alloc
+    out = d""
+    i = 0
+    while i < n
+        out = out + " "
+        i = i + 1
+    out
+
+fn is_digit(c: Int) -> Int
+    if c >= 48 && c <= 57
+        1
+    else
+        0

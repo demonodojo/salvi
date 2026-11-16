@@ -1,0 +1,154 @@
+# Lee bytes de stdin y los convierte en teclas (`keys.sal`).
+#
+# Una secuencia de escape llega casi siempre en la misma lectura que su ESC:
+# un ESC que termina la lectura es la tecla Esc. En Linux, si no hay más
+# bytes, se espera 25 ms con `read_timeout` por si el resto está en camino;
+# en soso `read_timeout` sobre la tty bloquearía, así que no se espera.
+#
+# En soso Ctrl-D no llega como byte: la tty lo convierte en un `read` de 0
+# bytes. Aquí ese 0 vuelve a ser Ctrl-D (4). Muchos ceros seguidos son un
+# stdin cerrado de verdad y dan `K_EOF`.
+import "io/io.sal"
+import "keys.sal"
+
+struct KeyReader
+    linux: Int
+    buf: Bytes
+    len: Int
+    pos: Int
+    zeros: Int
+
+static KeyReader.new(linux: Int) -> KeyReader ! alloc
+    KeyReader(linux, Bytes.new(256), 0, 0, 0)
+
+# Siguiente byte, bloqueando. -1 en fin de entrada; 4 si soso dio un 0 (Ctrl-D).
+method KeyReader.byte(&mut self) -> Int ! io
+    if self.pos < self.len
+        c = self.buf.get_u8(self.pos)
+        self.pos = self.pos + 1
+        return c
+    n = Fd.new(0).read(self.buf.ptr(), 256)
+    if n > 0
+        self.zeros = 0
+        self.len = n
+        self.pos = 1
+        return self.buf.get_u8(0)
+    if n == 0 && self.linux == 0
+        self.zeros = self.zeros + 1
+        if self.zeros < 64
+            return 4
+    return -1
+
+# ¿Hay un byte listo sin bloquear? (en Linux, espera hasta `ms`).
+method KeyReader.ready(&mut self, ms: Int) -> Int ! io
+    if self.pos < self.len
+        return 1
+    if self.linux == 0
+        return 0
+    n = Fd.new(0).read_timeout(self.buf.ptr(), 256, ms)
+    if n > 0
+        self.len = n
+        self.pos = 0
+        return 1
+    0
+
+method KeyReader.unread(&mut self) -> Unit
+    if self.pos > 0
+        self.pos = self.pos - 1
+
+method KeyReader.key(&mut self) -> Int ! io
+    c = self.byte()
+    if c < 0
+        return K_EOF
+    if c == 27
+        return self.escape()
+    if c >= 192 && c < 248
+        return self.utf8(c)
+    if c >= 128
+        return K_NONE
+    if c == 10
+        return K_ENTER
+    c
+
+method KeyReader.utf8(&mut self, lead: Int) -> Int ! io
+    more = 1
+    cp = lead & 31
+    if lead >= 240
+        more = 3
+        cp = lead & 7
+    elsif lead >= 224
+        more = 2
+        cp = lead & 15
+    while more > 0
+        c = self.byte()
+        if c < 128 || c >= 192
+            if c >= 0
+                self.unread()
+            return K_NONE
+        cp = (cp << 6) | (c & 63)
+        more = more - 1
+    cp
+
+method KeyReader.escape(&mut self) -> Int ! io
+    if self.ready(25) == 0
+        return K_ESC
+    c = self.byte()
+    if c == 91
+        return self.csi_seq()
+    if c == 79
+        if self.ready(25) == 0
+            return K_ESC
+        f = self.byte()
+        return ss3_key(f)
+    # Alt+tecla u otro ESC suelto: Esc y la tecla queda para la próxima lectura.
+    self.unread()
+    K_ESC
+
+method KeyReader.csi_seq(&mut self) -> Int ! io
+    p = 0
+    first = -1
+    guard = 0
+    while guard < 32
+        guard = guard + 1
+        if self.ready(25) == 0
+            return K_ESC
+        c = self.byte()
+        if c >= 48 && c <= 57
+            p = p * 10 + c - 48
+        elsif c == 59
+            if first < 0
+                first = p
+            p = 0
+        elsif c >= 64 && c <= 126
+            if first < 0
+                first = p
+            return csi_key(c, first)
+    K_NONE
+
+fn ss3_key(f: Int) -> Int
+    match f
+        65 => K_UP
+        66 => K_DOWN
+        67 => K_RIGHT
+        68 => K_LEFT
+        72 => K_HOME
+        70 => K_END
+        _ => K_NONE
+
+fn csi_key(final: Int, p: Int) -> Int
+    if final == 126
+        tilde_key(p)
+    else
+        ss3_key(final)
+
+fn tilde_key(p: Int) -> Int
+    match p
+        1 => K_HOME
+        7 => K_HOME
+        4 => K_END
+        8 => K_END
+        2 => K_INS
+        3 => K_DEL
+        5 => K_PGUP
+        6 => K_PGDN
+        _ => K_NONE
