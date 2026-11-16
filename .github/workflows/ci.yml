@@ -10,14 +10,24 @@ permissions:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    env:
+      SAL_REPO: ${{ vars.SAL_REPO || format('{0}/sal', github.repository_owner) }}
+      SAL_VERSION: ${{ vars.SAL_VERSION || 'latest' }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolver la etiqueta de sal
+        id: sal-etiqueta
+        run: echo "etiqueta=$(./scripts/obtener-sal.sh --etiqueta)" >> "$GITHUB_OUTPUT"
+
+      - name: Cachear el compilador sal
+        uses: actions/cache@v4
+        with:
+          path: target/toolchain
+          key: sal-${{ runner.os }}-${{ env.SAL_REPO }}-${{ steps.sal-etiqueta.outputs.etiqueta }}
+
       - name: Descargar el compilador sal
         id: sal
-        env:
-          SAL_REPO: ${{ vars.SAL_REPO || format('{0}/sal', github.repository_owner) }}
-          SAL_VERSION: ${{ vars.SAL_VERSION || 'latest' }}
         run: echo "ruta=$(./scripts/obtener-sal.sh target/toolchain)" >> "$GITHUB_OUTPUT"
 
       - name: Compilar salvi

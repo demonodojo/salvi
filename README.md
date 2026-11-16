@@ -77,6 +77,11 @@ modifica el árbol de soso.
 `tests/run_tests.py` sobre el binario de Linux. El compilador `sal` no se
 construye: lo baja de su última release con `scripts/obtener-sal.sh`.
 
+El caché se invalida con lo que de verdad cambia: el compilador se guarda
+bajo la etiqueta resuelta de la release de `sal` (no bajo `latest`) y el
+build de soso bajo el commit de `SOSO_REF`, con el build anterior como
+respaldo para recompilar solo lo necesario.
+
 Para publicar una versión, sube un tag `v*`:
 
 ```sh

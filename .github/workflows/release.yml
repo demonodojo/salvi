@@ -12,14 +12,26 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      SAL_REPO: ${{ vars.SAL_REPO || format('{0}/sal', github.repository_owner) }}
+      SAL_VERSION: ${{ vars.SAL_VERSION || 'latest' }}
+      SOSO_REPO: ${{ vars.SOSO_REPO || format('{0}/soso', github.repository_owner) }}
+      SOSO_REF: ${{ vars.SOSO_REF || 'main' }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolver la etiqueta de sal
+        id: sal-etiqueta
+        run: echo "etiqueta=$(./scripts/obtener-sal.sh --etiqueta)" >> "$GITHUB_OUTPUT"
+
+      - name: Cachear el compilador sal
+        uses: actions/cache@v4
+        with:
+          path: target/toolchain
+          key: sal-${{ runner.os }}-${{ env.SAL_REPO }}-${{ steps.sal-etiqueta.outputs.etiqueta }}
+
       - name: Descargar el compilador sal
         id: sal
-        env:
-          SAL_REPO: ${{ vars.SAL_REPO || format('{0}/sal', github.repository_owner) }}
-          SAL_VERSION: ${{ vars.SAL_VERSION || 'latest' }}
         run: echo "ruta=$(./scripts/obtener-sal.sh target/toolchain)" >> "$GITHUB_OUTPUT"
 
       - name: Dejar el compilador en ../sal
@@ -43,13 +55,27 @@ jobs:
           cp salvi README.md dist/linux/
           tar czf "salvi-${GITHUB_REF_NAME#v}-x86_64-linux.tar.gz" -C dist/linux .
 
-      - name: Clonar soso
-        env:
-          SOSO_REPO: ${{ vars.SOSO_REPO || format('{0}/soso', github.repository_owner) }}
-          SOSO_REF: ${{ vars.SOSO_REF || 'main' }}
+      - name: Situar y clonar soso
+        id: soso
         run: |
+          dir="$(dirname "$GITHUB_WORKSPACE")/soso"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
           git clone --depth 1 --branch "$SOSO_REF" \
-            "https://github.com/$SOSO_REPO.git" "$(dirname "$GITHUB_WORKSPACE")/soso"
+            "https://github.com/$SOSO_REPO.git" "$dir"
+          sha=
+          if json=$(curl -fsSL "https://api.github.com/repos/$SOSO_REPO/commits/$SOSO_REF"); then
+            sha=$(printf '%s' "$json" | jq -r '.sha // empty')
+          fi
+          [ -n "$sha" ] || sha=$SOSO_REF
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cachear el build de soso
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.soso.outputs.dir }}/target
+          key: soso-${{ runner.os }}-${{ env.SOSO_REPO }}-${{ steps.soso.outputs.sha }}
+          restore-keys: |
+            soso-${{ runner.os }}-${{ env.SOSO_REPO }}-
 
       - name: Compilar el paquete de soso
         env:

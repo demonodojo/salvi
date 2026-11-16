@@ -4,6 +4,7 @@
 # compilador.
 #
 #   scripts/obtener-sal.sh [destino]        (por defecto target/toolchain)
+#   scripts/obtener-sal.sh --etiqueta       solo imprime la etiqueta resuelta
 #
 # Variables:
 #   SAL_REPO       repositorio del compilador, owner/repo. Por defecto, el
@@ -13,29 +14,42 @@
 #   SAL_ASSET_URL  URL directa del artefacto: se salta el descubrimiento (útil
 #                  si la release usa nombres de fichero poco habituales).
 #
-# Imprime por stdout la ruta absoluta del ejecutable.
+# Imprime por stdout la ruta absoluta del ejecutable (o la etiqueta).
 set -eu
 
-destino=${1:-target/toolchain}
+modo=descargar
+destino=target/toolchain
+for arg in "$@"; do
+    case "$arg" in
+    --etiqueta) modo=etiqueta ;;
+    -*)
+        echo "obtener-sal: opción desconocida $arg" >&2
+        exit 2
+        ;;
+    *) destino=$arg ;;
+    esac
+done
 version=${SAL_VERSION:-latest}
+asset_url=${SAL_ASSET_URL:-}
+
+# Solo hace falta el repositorio si hay que preguntar a la API.
+repo=${SAL_REPO:-}
+if [ -z "$repo" ] && { [ "$modo" = etiqueta ] || [ -z "$asset_url" ]; }; then
+    owner=${GITHUB_REPOSITORY_OWNER:-}
+    if [ -z "$owner" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+        owner=${GITHUB_REPOSITORY%%/*}
+    fi
+    if [ -z "$owner" ]; then
+        echo "obtener-sal: define SAL_REPO (owner/repo) del compilador" >&2
+        exit 1
+    fi
+    repo="$owner/sal"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-url=${SAL_ASSET_URL:-}
-if [ -z "$url" ]; then
-    repo=${SAL_REPO:-}
-    if [ -z "$repo" ]; then
-        owner=${GITHUB_REPOSITORY_OWNER:-}
-        if [ -z "$owner" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-            owner=${GITHUB_REPOSITORY%%/*}
-        fi
-        if [ -z "$owner" ]; then
-            echo "obtener-sal: define SAL_REPO (owner/repo) del compilador" >&2
-            exit 1
-        fi
-        repo="$owner/sal"
-    fi
+descargar_json() {
     command -v jq >/dev/null 2>&1 || {
         echo "obtener-sal: hace falta jq para leer la release de $repo" >&2
         exit 1
@@ -45,10 +59,24 @@ if [ -z "$url" ]; then
     else
         api="https://api.github.com/repos/$repo/releases/tags/$version"
     fi
-    json=$(curl -fsSL "$api") || {
+    curl -fsSL "$api" || {
         echo "obtener-sal: no se pudo leer $api (¿existe la release?)" >&2
         exit 1
     }
+}
+
+if [ "$modo" = etiqueta ]; then
+    if [ "$version" != latest ]; then
+        echo "$version"
+        exit 0
+    fi
+    descargar_json | jq -er '.tag_name'
+    exit 0
+fi
+
+url=$asset_url
+if [ -z "$url" ]; then
+    json=$(descargar_json)
     # Preferimos el artefacto de Linux x86_64; si no lo hay, cualquiera cuyo
     # nombre mencione sal.
     url=$(printf '%s' "$json" | jq -r '
