@@ -71,6 +71,35 @@ paquete de `../soso/rootfs/share/paquetes/salvi/`; dentro de soso ejecuta
 `soso-pkg instalar salvi --origen /share/paquetes` y luego `salvi`. No
 modifica el árbol de soso.
 
+## CI y releases
+
+`.github/workflows/ci.yml` compila en cada push y en cada PR y pasa
+`tests/run_tests.py` sobre el binario de Linux. El compilador `sal` no se
+construye: lo baja de su última release con `scripts/obtener-sal.sh`.
+
+Para publicar una versión, sube un tag `v*`:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` compila salvi, pasa las pruebas, clona
+`../soso`, ejecuta `cargo xtask pkg-pack salvi` y publica una release con
+`salvi-<versión>-x86_64-linux.tar.gz` y `salvi-<versión>-soso.tar.gz` (el
+paquete que instala `soso-pkg`, con `paquete.txt` y `paquete.pack`).
+
+Variables de repositorio opcionales (Settings → Variables):
+
+| Variable | Por defecto | Uso |
+|---|---|---|
+| `SAL_REPO` | `<dueño>/sal` | Repositorio del compilador |
+| `SAL_VERSION` | `latest` | Tag de la release de `sal` a usar |
+| `SOSO_REPO` | `<dueño>/soso` | Repositorio de soso, para el paquete |
+| `SOSO_REF` | `main` | Rama de soso con la que empaquetar |
+
+El paquete toma la versión de `SALVI_VERSION` en `soso/xtask/src/pkg_pack.rs`;
+si no coincide con el tag, la release avisa y publica la que haya generado.
+
 ## Código
 
 | Ruta | Contenido |

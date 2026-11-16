@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descargar el compilador sal
+        id: sal
+        env:
+          SAL_REPO: ${{ vars.SAL_REPO || format('{0}/sal', github.repository_owner) }}
+          SAL_VERSION: ${{ vars.SAL_VERSION || 'latest' }}
+        run: echo "ruta=$(./scripts/obtener-sal.sh target/toolchain)" >> "$GITHUB_OUTPUT"
+
+      - name: Compilar salvi
+        env:
+          SAL: ${{ steps.sal.outputs.ruta }}
+        run: ./build.sh linux
+
+      - name: Pruebas en una pty
+        run: python3 tests/run_tests.py ./salvi
